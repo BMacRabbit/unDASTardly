@@ -1,0 +1,1164 @@
+// ════════════════════════════════════════════════════════════════════
+//  DAST — Dual Axis Solar Tracker  v2.9 final
+//  Espressif ESP32-S3 DevKitC-1
+//  Jrk G2 21v3 x2  |  Mosquitto MQTT  |  EC2 3.130.168.101
+//  AD8210 + Dale RS-2B 0.1Ohm  |  LCD 20x4 at 0x27
+//
+//  ── SERIAL COMMAND REFERENCE ─────────────────────────────────────
+//
+//  Set Serial Monitor to: 115200 baud  |  Both NL & CR
+//
+//  TRACKING TUNING:
+//    r<val>  AZ tracking rate (deg/sec at full normalized error)
+//              Lower = slower, smoother.  Higher = faster, may hunt.
+//              Outdoor sun: r10   Bench ceiling light: r15
+//              e.g. r10.0
+//
+//    e<val>  EL tracking rate (deg/sec at full normalized error)
+//              EL typically needs higher rate than AZ — weaker
+//              differential signal at high sun elevation angles.
+//              Outdoor sun: e15   Bench ceiling light: e20
+//              e.g. e15.0
+//
+//    d<val>  Deadband — error below this treated as zero (no movement)
+//              Too small: hunting at null.
+//              Too large: stops short of true null (shadow visible).
+//              Outdoor sun: d0.02   Bench: d0.1
+//              e.g. d0.02
+//
+//  GATE TUNING:
+//    g<val>  Gate threshold — tracking active when S < this value
+//              S is sum of all 4 LDR voltages. LOW = bright light.
+//              Confirmed values: bright sun S~0.05, dark S~12.4
+//              Set to 130% of measured bright S value.
+//              Outdoor direct sun: g0.31
+//              With paper attenuation: g2.0 to g5.0
+//              Bench ceiling light: g5.0
+//              e.g. g0.31
+//
+//    h<val>  Gate hysteresis — keeps gate open until S rises above
+//              (tuneGate + tuneGateHyst). Prevents gate chatter.
+//              Typical: h0.5
+//              e.g. h0.5
+//
+//    q<val>  Reacquire gate — S threshold for auto-reacquire after
+//              auto-stow. Must be HIGHER than tuneGate because at
+//              stow position (0,0 deg) only 2 of 4 LDRs face the sun.
+//              Total S is higher than in tracking position.
+//              Typical: q8.0
+//              e.g. q8.0
+//
+//  AUTO-STOW:
+//    t<val>  Dark timeout in MINUTES before auto-stow triggers.
+//              Gate must be closed continuously for this duration.
+//              Bench test: t1   Field operation: t10
+//              e.g. t10
+//
+//  POWER MONITORING:
+//    c<val>  VCAL — voltage calibration trim multiplier
+//              Adjust until LCD voltage matches DMM reading.
+//              VCAL = DMM_reading / LCD_reading
+//              Saved to flash — persists across uploads.
+//              e.g. c1.178
+//
+//    a<val>  ICAL — current calibration trim multiplier
+//              Adjust until LCD current matches DMM reading.
+//              ICAL = DMM_reading / LCD_reading
+//              Saved to flash — persists across uploads.
+//              e.g. a1.0
+//
+//    n<val>  Current zero offset in volts
+//              Boot with no current, read "Current zero pin:" from
+//              Serial at boot, enter that value here.
+//              Saved to flash — persists across uploads.
+//              e.g. n0.012
+//
+//  DATA AND LOGGING:
+//    l       Toggle CSV logging ON/OFF
+//              When ON: prints CSV rows to Serial at TELEMETRY_MS rate
+//              CSV header printed automatically when turned ON
+//              Node-RED file node also logs via MQTT independently
+//              CSV columns (19):
+//                timestamp, mode,
+//                cmd_az, act_az, err_az,
+//                cmd_el, act_el, err_el,
+//                trk_e_az, trk_e_el, trk_irrad, trk_valid, trk_state,
+//                panel_v, panel_i, panel_w,
+//                uptime_s, dark_timer_s, waiting_for_sun
+//
+//    v       Print one tracking snapshot containing:
+//              - Real time (NTP) and uptime
+//              - Gate state (OPEN/CLOSED) and total S value
+//              - Individual LDR voltages NE SE NW SW
+//              - Normalized error signals E_az and E_el
+//              - Commanded and actual axis positions
+//              - AZ and EL tracking rates
+//              - Dark timer and waiting_for_sun flag
+//              Use to check tracking health without continuous output.
+//
+//  TRACKING CONTROL:
+//    z       Re-arm tracking from current physical position
+//              Resets baseDeg to actual axis position.
+//              Use when base has drifted far from physical position.
+//              Only works in TRACK mode.
+//              Does NOT stow — instant re-arm.
+//
+//  SYSTEM:
+//    ?       Print this complete command reference and current values
+//
+//    !       Reset ALL tuning values to hardcoded defaults and save
+//              Use if tuning gets into a bad state.
+//              Defaults: r10 e15 d0.02 g0.31 h0.5 q8 t10
+//                        c1.178 a1.0 n0.0
+//
+//  ── OPERATING MODES ──────────────────────────────────────────────
+//  MANUAL  Hardware switch GND — pots control position
+//          Pots must move >50 counts from captured position to activate
+//          NeoPixel: AMBER
+//
+//  STOW    Both axes drive to 0,0 degrees
+//          NeoPixel: CYAN
+//
+//  STOWING Transitioning from stow to TRACK (3 second hold at stow)
+//          NeoPixel: PURPLE
+//
+//  TRACK   Rate controller null-seeks sun position
+//          base += rate x error x dt each 100ms cycle
+//          Gate closed: holds last position, dark timer counts up
+//          NeoPixel: GREEN
+//
+//  WAIT SUN Auto-stowed after dark timeout, waiting for light
+//          Reacquires when S < tuneReacquireGate for 5 seconds
+//          NeoPixel: CYAN
+//
+//  REMOTE  Node-RED dashboard setpoint control
+//          NeoPixel: BLUE
+//
+//  ESTOP   Holds last position, blocks all commands except RESUME
+//          NeoPixel: ORANGE pulse
+//
+//  ── LCD LAYOUT ───────────────────────────────────────────────────
+//  Row 0: V:20.45V  I:1.180A      panel voltage and current
+//  Row 1: P:19.08W  TRACK         panel power and operating mode
+//  Row 2: AZ: -45.0 EL: +30.0    actual axis angles in degrees
+//  Row 3: W:OK M:OK S:  0.05     WiFi, MQTT status, LDR S value
+//
+//  ── NEOPIXEL STATUS ──────────────────────────────────────────────
+//  Red solid      Jrk fault — check Jrk G2 utility for error flags
+//  White blink    WiFi reconnecting
+//  Orange pulse   ESTOP active
+//  Amber solid    MANUAL (POT) mode
+//  Cyan solid     STOW or WAIT SUN
+//  Purple solid   STOW_TO_TRACK transition
+//  Blue solid     REMOTE mode
+//  Green solid    TRACK mode — all systems OK
+//
+//  ── FIELD STARTUP PROCEDURE ──────────────────────────────────────
+//  1. Power ESP32 from Solar Manager 5V (USB disconnected)
+//  2. Confirm NeoPixel not red (Jrks OK)
+//  3. Switch to MANUAL — use pots to roughly aim at sun
+//  4. Switch to AUTO — stows — transitions to TRACK
+//  5. Type z to re-arm from current position
+//  6. Type l to confirm CSV logging active
+//  7. Type ? to confirm all tuning values
+//  8. Type v after 2-3 minutes to check tracking snapshot
+//
+//  ── NOTES ON KNOWN LIMITATIONS ───────────────────────────────────
+//  LDR saturation: PDV-P5001 saturates in direct sun (S~0).
+//    Paper attenuation required. Upgrade: BPW21R photodiodes.
+//    Code supports photodiodes via USE_PHOTODIODE define.
+//
+//  Current measurement: AD8210 measures charge current via Solar
+//    Manager — drops to zero when CN3791 stops charging (battery full).
+//    For true panel current: disconnect Solar Manager, connect shunt
+//    directly across panels. Two P108 parallel Isc=1.08A, shunt
+//    dissipation = 1.08^2 x 0.1 = 0.117W (rated 3W, safe).
+//    Recommended upgrade: INA226 for simultaneous V+I measurement.
+//
+//  ── REQUIRED LIBRARIES ───────────────────────────────────────────
+//  JrkG2  PubSubClient  ArduinoJson
+//  Adafruit NeoPixel  LiquidCrystal_I2C  Preferences
+// ════════════════════════════════════════════════════════════════════
+
+// #define USE_PHOTODIODE
+#define USE_LDR
+
+#if defined(USE_PHOTODIODE) && defined(USE_LDR)
+  #error "Define either USE_PHOTODIODE or USE_LDR, not both."
+#endif
+#if !defined(USE_PHOTODIODE) && !defined(USE_LDR)
+  #error "Define either USE_PHOTODIODE or USE_LDR, neither selected."
+#endif
+
+#include <Wire.h>
+#include <JrkG2.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#include <time.h>
+
+// ── LCD ──────────────────────────────────────────────────────────────
+#define LCD_I2C_ADDR 0x27
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 20, 4);
+
+// ── NVS ──────────────────────────────────────────────────────────────
+Preferences prefs;
+
+// ── NETWORK ──────────────────────────────────────────────────────────
+const char* WIFI_SSID       = "NETGEAR08";
+const char* WIFI_PASSWORD   = "pinktrumpet867";
+const char* MQTT_SERVER     = "3.130.168.101";
+const int   MQTT_PORT       = 1883;
+const char* MQTT_USER       = "dast";
+const char* MQTT_PASS       = "unREALGems@419";
+const char* MQTT_CLIENT_ID  = "DAST-ESP32S3-DevKit";
+const char* TOPIC_TELEMETRY = "dast/telemetry";
+const char* TOPIC_COMMAND   = "dast/command";
+const char* TOPIC_STATUS    = "dast/status";
+
+// ── NTP ──────────────────────────────────────────────────────────────
+const char* NTP_SERVER = "pool.ntp.org";
+const long  GMT_OFFSET = -6 * 3600;  // UTC-6 Central Time
+const int   DST_OFFSET = 3600;       // DST +1hr
+
+// ── JRK G2 ───────────────────────────────────────────────────────────
+JrkG2I2C jrkAZ(11);
+JrkG2I2C jrkEL(12);
+
+// ── PINS ─────────────────────────────────────────────────────────────
+const int PIN_SDA           = 11;
+const int PIN_SCL           = 12;
+const int PIN_NEOPIXEL      = 38;
+const int PIN_Q1            = 1;
+const int PIN_Q2            = 2;
+const int PIN_Q3            = 3;
+const int PIN_Q4            = 4;
+const int PIN_PANEL_VOLTAGE = 5;
+const int PIN_PANEL_CURRENT = 6;
+const int PIN_SWITCH        = 7;
+const int PIN_POT_AZ        = 8;
+const int PIN_POT_EL        = 9;
+
+// ── NEOPIXEL ─────────────────────────────────────────────────────────
+Adafruit_NeoPixel neo(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+#define NEO_BRIGHTNESS 40
+#define C_RED    neo.Color(180,  0,  0)
+#define C_ORANGE neo.Color(180, 50,  0)
+#define C_AMBER  neo.Color(180, 80,  0)
+#define C_GREEN  neo.Color(  0,180,  0)
+#define C_BLUE   neo.Color(  0,  0,180)
+#define C_PURPLE neo.Color(100,  0,180)
+#define C_WHITE  neo.Color(180,180,180)
+#define C_CYAN   neo.Color(  0,180,180)
+#define C_OFF    neo.Color(  0,  0,  0)
+
+// ── ADC ──────────────────────────────────────────────────────────────
+const int NUM_SAMPLES = 8;
+const int TRACK_SAMP  = 32;
+
+// ── FIXED HARDWARE CONSTANTS ─────────────────────────────────────────
+const float INA_OPAMP_GAIN = 20.0f;  // AD8210 fixed gain
+const float SHUNT_OHMS     =  0.1f;  // Dale RS-2B
+const float VDIV_RATIO     = 20.17f; // confirmed bench measurement
+
+// ── TUNING DEFAULTS — used on first boot or after ! reset ────────────
+const float DEF_VCAL           =  1.178f;
+const float DEF_ICAL           =  1.0f;
+const float DEF_CURRENT_ZERO_V =  0.0f;
+const float DEF_RATE_AZ        = 10.0f;
+const float DEF_RATE_EL        = 15.0f;
+const float DEF_DB             =  0.02f;
+const float DEF_GATE           =  0.31f;
+const float DEF_GATE_HYST      =  0.5f;
+const float DEF_REACQUIRE_GATE =  8.0f;
+const float DEF_DARK_TIMEOUT   = 10.0f;
+
+// ── LIVE TUNING — loaded from NVS at boot ────────────────────────────
+float vcal              = DEF_VCAL;
+float ical              = DEF_ICAL;
+float currentZeroV      = DEF_CURRENT_ZERO_V;
+float tuneRateAZ        = DEF_RATE_AZ;
+float tuneRateEL        = DEF_RATE_EL;
+float tuneDB            = DEF_DB;
+float tuneGate          = DEF_GATE;
+float tuneGateHyst      = DEF_GATE_HYST;
+float tuneReacquireGate = DEF_REACQUIRE_GATE;
+float tuneDarkTimeout   = DEF_DARK_TIMEOUT;
+
+// ── AXIS CALIBRATION ─────────────────────────────────────────────────
+const int   POT_COUNT_MIN     = 0;
+const int   POT_COUNT_MAX     = 4095;
+const int   AZ_COUNT_ZERO     = 2176;
+const int   EL_COUNT_ZERO     = 2175;
+const int   POT_PICKUP_COUNTS = 50;
+const float AZ_MAX_ANGLE      = 90.0f;
+const float EL_MAX_ANGLE      = 80.0f;
+const int   JRK_MIN           = 0;
+const int   JRK_MAX           = 4095;
+const int   STOW_TOL          = 30;
+
+// ── TIMING ───────────────────────────────────────────────────────────
+const unsigned long STOW_TO_TRACK_DELAY_MS = 3000UL;
+const unsigned long REACQUIRE_DELAY_MS     = 5000UL;
+const unsigned long HEARTBEAT_TIMEOUT_MS   = 90000UL;
+const unsigned long LOOP_MS                = 100UL;
+const unsigned long MQTT_RECONNECT_MS      = 30000UL;
+const unsigned long WIFI_RETRY_MS          = 15000UL;
+const unsigned long TELEMETRY_MS           = 2000UL;
+const unsigned long LCD_UPDATE_MS          = 500UL;
+
+// ── OPERATING MODE ───────────────────────────────────────────────────
+enum Mode { POT, REMOTE, STOW, ESTOP, TRACK, STOW_TO_TRACK };
+Mode currentMode = STOW;
+Mode lastMode    = STOW;
+
+// ── STATE ────────────────────────────────────────────────────────────
+float remoteAZ = 0.0f, remoteEL = 0.0f;
+float heldAZ   = 0.0f, heldEL   = 0.0f;
+float holdAZ   = 0.0f, holdEL   = 0.0f;
+
+bool  prevSwitchManual = false;
+int   capturedPotAZ    = 0, capturedPotEL = 0;
+bool  azPickedUp       = false, elPickedUp = false;
+
+unsigned long stowConfirmedMs  = 0;
+bool          stowConfirmed    = false;
+unsigned long lastHeartbeatMs  = 0;
+bool          dashboardActive  = false;
+
+float panelVoltage = 0.0f, panelCurrent = 0.0f, panelPower = 0.0f;
+
+bool          wifiWasConnected  = false;
+unsigned long lastWifiAttempt   = 0;
+unsigned long lastMqttAttempt   = 0;
+bool          printTrackingSnap = false;
+bool          csvLogging        = false;
+bool          ntpSynced         = false;
+
+// ── AUTO-STOW / REACQUIRE ────────────────────────────────────────────
+bool          waitingForSun  = false;
+unsigned long darkStartMs    = 0;
+unsigned long autoStowedAtMs = 0;
+bool          gateWasOpen    = false;
+
+WiFiClient   wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+// ── TRACKING STATE ───────────────────────────────────────────────────
+struct SenseResult { float E_az, E_el, S; bool valid; };
+struct TrackAxis   { float baseDeg; };
+
+TrackAxis   trackAZ   = { 0.0f };
+TrackAxis   trackEL   = { 0.0f };
+SenseResult lastSense = { 0.0f, 0.0f, 0.0f, false };
+float       trkCmdAZ  = 0.0f, trkCmdEL = 0.0f;
+
+enum TrackState { TRK_ACTIVE, TRK_FROZEN };
+TrackState    trkState  = TRK_FROZEN;
+unsigned long trkLossMs = 0;
+
+
+// ════════════════════════════════════════════════════════════════════
+//  NVS LOAD / SAVE / RESET
+// ════════════════════════════════════════════════════════════════════
+void nvsLoad() {
+    prefs.begin("dast", true);  // read-only
+    tuneRateAZ        = prefs.getFloat("rateAZ",    DEF_RATE_AZ);
+    tuneRateEL        = prefs.getFloat("rateEL",    DEF_RATE_EL);
+    tuneDB            = prefs.getFloat("db",        DEF_DB);
+    tuneGate          = prefs.getFloat("gate",      DEF_GATE);
+    tuneGateHyst      = prefs.getFloat("gateHyst",  DEF_GATE_HYST);
+    tuneReacquireGate = prefs.getFloat("reacqGate", DEF_REACQUIRE_GATE);
+    tuneDarkTimeout   = prefs.getFloat("darkTO",    DEF_DARK_TIMEOUT);
+    vcal              = prefs.getFloat("vcal",      DEF_VCAL);
+    ical              = prefs.getFloat("ical",      DEF_ICAL);
+    currentZeroV      = prefs.getFloat("czero",     DEF_CURRENT_ZERO_V);
+    prefs.end();
+}
+
+void nvsSave() {
+    prefs.begin("dast", false);  // read-write
+    prefs.putFloat("rateAZ",    tuneRateAZ);
+    prefs.putFloat("rateEL",    tuneRateEL);
+    prefs.putFloat("db",        tuneDB);
+    prefs.putFloat("gate",      tuneGate);
+    prefs.putFloat("gateHyst",  tuneGateHyst);
+    prefs.putFloat("reacqGate", tuneReacquireGate);
+    prefs.putFloat("darkTO",    tuneDarkTimeout);
+    prefs.putFloat("vcal",      vcal);
+    prefs.putFloat("ical",      ical);
+    prefs.putFloat("czero",     currentZeroV);
+    prefs.end();
+}
+
+void nvsReset() {
+    tuneRateAZ        = DEF_RATE_AZ;
+    tuneRateEL        = DEF_RATE_EL;
+    tuneDB            = DEF_DB;
+    tuneGate          = DEF_GATE;
+    tuneGateHyst      = DEF_GATE_HYST;
+    tuneReacquireGate = DEF_REACQUIRE_GATE;
+    tuneDarkTimeout   = DEF_DARK_TIMEOUT;
+    vcal              = DEF_VCAL;
+    ical              = DEF_ICAL;
+    currentZeroV      = DEF_CURRENT_ZERO_V;
+    nvsSave();
+    Serial.println(F("  All values reset to defaults and saved to flash"));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  NTP TIME
+// ════════════════════════════════════════════════════════════════════
+String getTimeStr() {
+    struct tm t;
+    if (!ntpSynced || !getLocalTime(&t)) return String("--:--:--");
+    char buf[10]; strftime(buf, 10, "%H:%M:%S", &t);
+    return String(buf);
+}
+
+String getTimestampCSV() {
+    struct tm t;
+    if (!ntpSynced || !getLocalTime(&t)) return String(millis());
+    char buf[24]; strftime(buf, 24, "%Y-%m-%dT%H:%M:%S", &t);
+    return String(buf);
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SENSOR — PHOTODIODE
+// ════════════════════════════════════════════════════════════════════
+#ifdef USE_PHOTODIODE
+bool gateActive = false;
+float trackAdcV(int pin) {
+    uint32_t acc = 0;
+    for (int i = 0; i < TRACK_SAMP; i++) acc += analogReadMilliVolts(pin);
+    return (float)acc / TRACK_SAMP / 1000.0f;
+}
+SenseResult readSensors() {
+    float q1=trackAdcV(PIN_Q1), q2=trackAdcV(PIN_Q2);
+    float q3=trackAdcV(PIN_Q3), q4=trackAdcV(PIN_Q4);
+    float saz=q1+q2, sel=q3+q4, S=saz+sel;
+    float thr = gateActive ? (tuneGate-tuneGateHyst) : tuneGate;
+    gateActive = (S > thr);
+    SenseResult r; r.S=S; r.valid=gateActive;
+    r.E_az = (saz>0.05f) ? (q1-q2)/saz : 0.0f;
+    r.E_el = (sel>0.05f) ? (q3-q4)/sel : 0.0f;
+    return r;
+}
+#endif
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SENSOR — LDR
+//  3.3V -> 4.7kOhm -> junction -> LDR -> GND
+//  Bright=LOW  Shadow=HIGH  Gate opens when S < tuneGate
+//  E_az positive = sun EAST  = AZ base increases = moves east
+//  E_el positive = sun NORTH = EL base decreases = moves north
+// ════════════════════════════════════════════════════════════════════
+#ifdef USE_LDR
+bool gateActive = false;
+float trackAdcV(int pin) {
+    uint32_t acc = 0;
+    for (int i = 0; i < TRACK_SAMP; i++) acc += analogReadMilliVolts(pin);
+    return (float)acc / TRACK_SAMP / 1000.0f;
+}
+SenseResult readSensors() {
+    float q1=trackAdcV(PIN_Q1), q2=trackAdcV(PIN_Q2);
+    float q3=trackAdcV(PIN_Q3), q4=trackAdcV(PIN_Q4);
+    float east=q1+q2, west=q3+q4, north=q1+q3, south=q2+q4;
+    float S=q1+q2+q3+q4;
+    float thr = gateActive ? (tuneGate+tuneGateHyst) : tuneGate;
+    gateActive = (S < thr);
+    SenseResult r; r.S=S; r.valid=gateActive;
+    float Sf = (S>0.02f) ? S : 0.02f;
+    r.E_az = constrain((west-east)  / Sf, -1.0f, 1.0f);
+    r.E_el = constrain((south-north)/ Sf, -1.0f, 1.0f);
+    return r;
+}
+#endif
+
+
+// ════════════════════════════════════════════════════════════════════
+//  RATE CONTROLLER + AUTO-STOW / REACQUIRE
+// ════════════════════════════════════════════════════════════════════
+void runTracking(uint32_t now) {
+    SenseResult s = readSensors();
+    lastSense = s;
+    float dt = LOOP_MS / 1000.0f;
+    unsigned long darkTimeoutMs = (unsigned long)(tuneDarkTimeout * 60000.0f);
+
+    // Reacquire check while waiting for sun
+    if (waitingForSun) {
+        bool partialSun = (s.S < tuneReacquireGate);
+        if (partialSun && autoStowedAtMs > 0) {
+            unsigned long settled = now - autoStowedAtMs;
+            if (settled >= REACQUIRE_DELAY_MS) {
+                waitingForSun=false; gateWasOpen=false;
+                darkStartMs=0; autoStowedAtMs=0;
+                Serial.println(F("[AUTO] Sun detected — reacquiring"));
+                uint16_t sfAZ=jrkAZ.getScaledFeedback();
+                uint16_t sfEL=jrkEL.getScaledFeedback();
+                trackAZ.baseDeg = scaledFeedbackToAngle(sfAZ, AZ_MAX_ANGLE);
+                trackEL.baseDeg = scaledFeedbackToAngle(sfEL, EL_MAX_ANGLE);
+                trkState=TRK_FROZEN; trkCmdAZ=trackAZ.baseDeg; trkCmdEL=trackEL.baseDeg;
+                currentMode=STOW_TO_TRACK; lastMode=TRACK;
+                stowConfirmed=false; stowConfirmedMs=0;
+                Serial.print(F("  Reacquire base AZ:")); Serial.print(trackAZ.baseDeg,1);
+                Serial.print(F("  EL:")); Serial.println(trackEL.baseDeg,1);
+            } else {
+                static unsigned long lastMsg=0;
+                if (now-lastMsg>1000) {
+                    lastMsg=now;
+                    Serial.print(F("[AUTO] Partial sun — reacquire in "));
+                    Serial.print((REACQUIRE_DELAY_MS-(now-autoStowedAtMs))/1000);
+                    Serial.println(F("s"));
+                }
+            }
+        }
+        trkCmdAZ=constrain(trackAZ.baseDeg,-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+        trkCmdEL=constrain(trackEL.baseDeg,-EL_MAX_ANGLE,EL_MAX_ANGLE);
+        return;
+    }
+
+    // Normal tracking
+    if (s.valid) {
+        if (!gateWasOpen) { gateWasOpen=true; darkStartMs=0; }
+        if (trkState!=TRK_ACTIVE) { Serial.println(F("[TRACK] ACTIVE")); trkState=TRK_ACTIVE; }
+        trkLossMs=0;
+        float errAZ=(fabsf(s.E_az)>tuneDB)?s.E_az:0.0f;
+        float errEL=(fabsf(s.E_el)>tuneDB)?s.E_el:0.0f;
+        trackAZ.baseDeg += tuneRateAZ * errAZ * dt;
+        trackEL.baseDeg -= tuneRateEL * errEL * dt;
+        trackAZ.baseDeg=constrain(trackAZ.baseDeg,-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+        trackEL.baseDeg=constrain(trackEL.baseDeg,-EL_MAX_ANGLE,EL_MAX_ANGLE);
+    } else {
+        if (gateWasOpen) {
+            gateWasOpen=false; darkStartMs=now;
+            if (trkState==TRK_ACTIVE) { Serial.println(F("[TRACK] Signal lost — holding")); trkState=TRK_FROZEN; }
+        }
+        if (darkStartMs>0 && (now-darkStartMs)>darkTimeoutMs) {
+            Serial.print(F("[AUTO] Dark >")); Serial.print((int)tuneDarkTimeout);
+            Serial.println(F("min — auto-stowing"));
+            currentMode=STOW; lastMode=TRACK;
+            waitingForSun=true; autoStowedAtMs=now; darkStartMs=0;
+            trkState=TRK_FROZEN; trackAZ.baseDeg=0.0f; trackEL.baseDeg=0.0f;
+        }
+    }
+
+    trkCmdAZ=constrain(trackAZ.baseDeg,-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+    trkCmdEL=constrain(trackEL.baseDeg,-EL_MAX_ANGLE,EL_MAX_ANGLE);
+
+    // Snapshot on demand
+    if (printTrackingSnap) {
+        printTrackingSnap=false;
+        float q1=trackAdcV(PIN_Q1), q2=trackAdcV(PIN_Q2);
+        float q3=trackAdcV(PIN_Q3), q4=trackAdcV(PIN_Q4);
+        unsigned long darkSec=(darkStartMs>0&&!s.valid)?(now-darkStartMs)/1000:0;
+        Serial.println(F("  ── Snapshot ───────────────────────────────"));
+        Serial.print(F("  Time: ")); Serial.print(getTimeStr());
+        Serial.print(F("  Uptime: ")); Serial.print(now/1000); Serial.println(F("s"));
+        Serial.print(F("  Gate:")); Serial.print(s.valid?"OPEN":"CLOSED");
+        Serial.print(F("  S=")); Serial.println(s.S,4);
+        Serial.print(F("  NE(Q1):")); Serial.print(q1,4);
+        Serial.print(F("  SE(Q2):")); Serial.print(q2,4);
+        Serial.print(F("  NW(Q3):")); Serial.print(q3,4);
+        Serial.print(F("  SW(Q4):")); Serial.println(q4,4);
+        Serial.print(F("  E_az=")); Serial.print(s.E_az,4);
+        Serial.print(F("  E_el=")); Serial.println(s.E_el,4);
+        Serial.print(F("  cmd_az=")); Serial.print(trkCmdAZ,2);
+        Serial.print(F("  cmd_el=")); Serial.println(trkCmdEL,2);
+        Serial.print(F("  RateAZ=")); Serial.print(tuneRateAZ,1);
+        Serial.print(F("  RateEL=")); Serial.println(tuneRateEL,1);
+        Serial.print(F("  Dark: ")); Serial.print(darkSec); Serial.println(F("s"));
+        Serial.print(F("  WaitSun: ")); Serial.println(waitingForSun?"YES":"NO");
+        Serial.print(F("  Panel: ")); Serial.print(panelVoltage,2);
+        Serial.print(F("V  ")); Serial.print(panelCurrent,3);
+        Serial.print(F("A  ")); Serial.print(panelPower,2); Serial.println(F("W"));
+        Serial.println(F("  ───────────────────────────────────────────"));
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  CONVERSION FUNCTIONS
+// ════════════════════════════════════════════════════════════════════
+int readPotCounts(int pin) {
+    long sum=0;
+    for (int i=0; i<NUM_SAMPLES; i++) sum+=analogRead(pin);
+    return (int)(sum/NUM_SAMPLES);
+}
+
+float countsToAngle(int counts, int zeroCount, float maxAngle) {
+    int span = (counts<=zeroCount) ? (zeroCount-POT_COUNT_MIN) : (POT_COUNT_MAX-zeroCount);
+    if (span==0) return 0.0f;
+    return constrain(((float)(counts-zeroCount)/span)*maxAngle,-maxAngle,maxAngle);
+}
+
+uint16_t angleToTarget(float angle, float maxAngle) {
+    float t=(constrain(angle,-maxAngle,maxAngle)+maxAngle)/(2.0f*maxAngle);
+    return (uint16_t)constrain((int)(t*JRK_MAX),JRK_MIN,JRK_MAX);
+}
+
+float scaledFeedbackToAngle(uint16_t sf, float maxAngle) {
+    return ((float)sf/JRK_MAX)*(2.0f*maxAngle)-maxAngle;
+}
+
+bool bothAxesAtStow() {
+    uint16_t tAZ=angleToTarget(0.0f,AZ_MAX_ANGLE), tEL=angleToTarget(0.0f,EL_MAX_ANGLE);
+    return (abs((int)jrkAZ.getScaledFeedback()-(int)tAZ)<=STOW_TOL) &&
+           (abs((int)jrkEL.getScaledFeedback()-(int)tEL)<=STOW_TOL);
+}
+
+void armTracking() {
+    uint16_t sfAZ=jrkAZ.getScaledFeedback(), sfEL=jrkEL.getScaledFeedback();
+    trackAZ.baseDeg=scaledFeedbackToAngle(sfAZ,AZ_MAX_ANGLE);
+    trackEL.baseDeg=scaledFeedbackToAngle(sfEL,EL_MAX_ANGLE);
+    trkState=TRK_FROZEN; trkLossMs=0;
+    trkCmdAZ=trackAZ.baseDeg; trkCmdEL=trackEL.baseDeg;
+    gateWasOpen=false; darkStartMs=0; waitingForSun=false; autoStowedAtMs=0;
+    Serial.print(F("  Tracking armed AZ:")); Serial.print(trackAZ.baseDeg,1);
+    Serial.print(F("  EL:")); Serial.println(trackEL.baseDeg,1);
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  POWER SENSING
+// ════════════════════════════════════════════════════════════════════
+float adcPinVolts(int pin) {
+    long sum=0;
+    for (int i=0; i<NUM_SAMPLES; i++) sum+=analogRead(pin);
+    return (float)(sum/NUM_SAMPLES)*(3.3f/4095.0f);
+}
+float readPanelVoltage() { return adcPinVolts(PIN_PANEL_VOLTAGE)*VDIV_RATIO*vcal; }
+float readPanelCurrent() {
+    float v=adcPinVolts(PIN_PANEL_CURRENT)-currentZeroV;
+    if (v<0.0f) v=0.0f;
+    return (v/(INA_OPAMP_GAIN*SHUNT_OHMS))*ical;
+}
+void updatePanelReadings() {
+    panelVoltage=readPanelVoltage();
+    panelCurrent=readPanelCurrent();
+    panelPower=panelVoltage*panelCurrent;
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  NEOPIXEL
+// ════════════════════════════════════════════════════════════════════
+void updateNeoPixel(bool jrkOK, bool mqttOK, bool wifiReconnecting) {
+    (void)mqttOK;
+    static unsigned long lastBlink=0; static bool blinkOn=false;
+    unsigned long now=millis(); uint32_t colour=C_OFF;
+    if (!jrkOK)                               colour=C_RED;
+    else if (waitingForSun)                   colour=C_CYAN;
+    else if (currentMode==ESTOP)              { if(now-lastBlink>600){lastBlink=now;blinkOn=!blinkOn;} colour=blinkOn?C_ORANGE:C_OFF; }
+    else if (wifiReconnecting&&currentMode!=POT) { if(now-lastBlink>150){lastBlink=now;blinkOn=!blinkOn;} colour=blinkOn?C_WHITE:C_OFF; }
+    else { switch(currentMode) {
+        case POT:           colour=C_AMBER;  break;
+        case STOW:          colour=C_CYAN;   break;
+        case STOW_TO_TRACK: colour=C_PURPLE; break;
+        case REMOTE:        colour=C_BLUE;   break;
+        case TRACK:         colour=C_GREEN;  break;
+        default:            colour=C_OFF;    break;
+    }}
+    neo.setPixelColor(0,colour); neo.show();
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  LCD — 20x4
+//  Row 0: "V:20.45V  I:1.180A  "
+//  Row 1: "P:19.08W  MANUAL    "
+//  Row 2: "AZ: -90.0 EL: +80.0 "
+//  Row 3: "W:OK M:OK S:  0.05  "
+// ════════════════════════════════════════════════════════════════════
+void lcdPF(float val, int w, int d) { char buf[12]; dtostrf(val,w,d,buf); lcd.print(buf); }
+
+void updateLCD(float actAZ, float actEL, bool wifiOK, bool mqttOK) {
+    lcd.setCursor(0,0);
+    lcd.print(F("V:")); lcdPF(panelVoltage,5,2);
+    lcd.print(F("V  I:")); lcdPF(panelCurrent,5,3); lcd.print(F("A  "));
+
+    lcd.setCursor(0,1);
+    lcd.print(F("P:")); lcdPF(panelPower,5,2); lcd.print(F("W  "));
+    if (waitingForSun) { lcd.print(F("WAIT SUN  ")); }
+    else { switch(currentMode) {
+        case POT:           lcd.print(F("MANUAL    ")); break;
+        case REMOTE:        lcd.print(F("REMOTE    ")); break;
+        case STOW:          lcd.print(F("STOW      ")); break;
+        case ESTOP:         lcd.print(F("ESTOP     ")); break;
+        case TRACK:         lcd.print(F("TRACK     ")); break;
+        case STOW_TO_TRACK: lcd.print(F("STOWING   ")); break;
+        default:            lcd.print(F("----------")); break;
+    }}
+
+    lcd.setCursor(0,2);
+    lcd.print(F("AZ:")); lcdPF(actAZ,6,1);
+    lcd.print(F(" EL:")); lcdPF(actEL,6,1); lcd.print(F(" "));
+
+    lcd.setCursor(0,3);
+    lcd.print(wifiOK?F("W:OK "):F("W:-- "));
+    lcd.print(mqttOK?F("M:OK "):F("M:-- "));
+    lcd.print(F("S:")); lcdPF(lastSense.S,5,2); lcd.print(F("  "));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SERIAL TUNING — prints full reference on ?
+// ════════════════════════════════════════════════════════════════════
+void printHelp() {
+    Serial.println(F(""));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  DAST v2.9 — Serial Command Reference"));
+    Serial.println(F("  All values saved to flash — survive uploads"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  TRACKING TUNING:"));
+    Serial.print(F("    r  AZ rate (deg/sec)    current: ")); Serial.println(tuneRateAZ,2);
+    Serial.print(F("    e  EL rate (deg/sec)    current: ")); Serial.println(tuneRateEL,2);
+    Serial.print(F("    d  Deadband             current: ")); Serial.println(tuneDB,4);
+    Serial.println(F("  GATE TUNING:"));
+    Serial.print(F("    g  Gate threshold       current: ")); Serial.println(tuneGate,3);
+    Serial.print(F("    h  Gate hysteresis      current: ")); Serial.println(tuneGateHyst,2);
+    Serial.print(F("    q  Reacquire gate       current: ")); Serial.println(tuneReacquireGate,1);
+    Serial.println(F("  AUTO-STOW:"));
+    Serial.print(F("    t  Dark timeout (min)   current: ")); Serial.println(tuneDarkTimeout,1);
+    Serial.println(F("  POWER MONITORING:"));
+    Serial.print(F("    c  VCAL voltage trim    current: ")); Serial.println(vcal,4);
+    Serial.print(F("    a  ICAL current trim    current: ")); Serial.println(ical,4);
+    Serial.print(F("    n  Current zero (V)     current: ")); Serial.println(currentZeroV,4);
+    Serial.println(F("  DATA:"));
+    Serial.print(F("    l  CSV logging          current: ")); Serial.println(csvLogging?"ON":"OFF");
+    Serial.println(F("    v  Tracking snapshot (time + LDR voltages + errors)"));
+    Serial.println(F("  CONTROL:"));
+    Serial.println(F("    z  Re-arm tracking from current physical position"));
+    Serial.println(F("       Use when base has drifted — only works in TRACK"));
+    Serial.println(F("    !  Reset ALL values to defaults and save to flash"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  QUICK REFERENCE:"));
+    Serial.println(F("    Outdoor sun:  g0.31 h0.5 r10 e15 d0.02 t10 q8"));
+    Serial.println(F("    Paper atten:  g2.0  h0.5 r10 e15 d0.02 t10 q8"));
+    Serial.println(F("    Bench light:  g5.0  h1.0 r15 e20 d0.1  t1  q8"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.print(F("  NTP time: ")); Serial.print(getTimeStr());
+    Serial.print(F("  Uptime: ")); Serial.print(millis()/1000); Serial.println(F("s"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F(""));
+}
+
+void handleSerialTuning() {
+    static String buf="";
+    while (Serial.available()) {
+        char c=(char)Serial.read();
+        if (c=='\n'||c=='\r') {
+            buf.trim();
+            if (buf.length()==0) { buf=""; return; }
+            char  cmd=buf.charAt(0);
+            float val=buf.substring(1).toFloat();
+            switch(cmd) {
+                case 'r': case 'R': tuneRateAZ=val; nvsSave();
+                    Serial.print(F("  AZ Rate -> ")); Serial.print(tuneRateAZ,2); Serial.println(F(" (saved)")); break;
+                case 'e': case 'E': tuneRateEL=val; nvsSave();
+                    Serial.print(F("  EL Rate -> ")); Serial.print(tuneRateEL,2); Serial.println(F(" (saved)")); break;
+                case 'd': case 'D': tuneDB=val; nvsSave();
+                    Serial.print(F("  Deadband -> ")); Serial.print(tuneDB,4); Serial.println(F(" (saved)")); break;
+                case 'g': case 'G': tuneGate=val; nvsSave();
+                    Serial.print(F("  GateThresh -> ")); Serial.print(tuneGate,3); Serial.println(F(" (saved)")); break;
+                case 'h': case 'H': tuneGateHyst=val; nvsSave();
+                    Serial.print(F("  GateHyst -> ")); Serial.print(tuneGateHyst,2); Serial.println(F(" (saved)")); break;
+                case 'q': case 'Q': tuneReacquireGate=val; nvsSave();
+                    Serial.print(F("  ReacquireGate -> ")); Serial.print(tuneReacquireGate,1); Serial.println(F(" (saved)")); break;
+                case 't': case 'T': tuneDarkTimeout=val; nvsSave();
+                    Serial.print(F("  DarkTimeout -> ")); Serial.print(tuneDarkTimeout,1); Serial.println(F("min (saved)")); break;
+                case 'c': case 'C': vcal=val; nvsSave();
+                    Serial.print(F("  VCAL -> ")); Serial.print(vcal,4); Serial.println(F(" (saved)")); break;
+                case 'a': case 'A': ical=val; nvsSave();
+                    Serial.print(F("  ICAL -> ")); Serial.print(ical,4); Serial.println(F(" (saved)")); break;
+                case 'n': case 'N': currentZeroV=val; nvsSave();
+                    Serial.print(F("  CurrentZero -> ")); Serial.print(currentZeroV,4); Serial.println(F("V (saved)")); break;
+                case 'l': case 'L':
+                    csvLogging=!csvLogging;
+                    if (csvLogging) {
+                        Serial.println(F("  CSV logging ON"));
+                        Serial.println(F("timestamp,mode,cmd_az,act_az,err_az,cmd_el,act_el,err_el,trk_e_az,trk_e_el,trk_irrad,trk_valid,trk_state,panel_v,panel_i,panel_w,uptime_s,dark_timer_s,waiting_for_sun"));
+                    } else { Serial.println(F("  CSV logging OFF")); }
+                    break;
+                case 'z': case 'Z':
+                    if (currentMode==TRACK) { armTracking(); Serial.println(F("  Re-armed from current position")); }
+                    else Serial.println(F("  z only works in TRACK mode"));
+                    break;
+                case 'v': case 'V': printTrackingSnap=true; break;
+                case '?': printHelp(); break;
+                case '!': nvsReset(); printHelp(); break;
+                default:
+                    Serial.print(F("  Unknown: ")); Serial.println(buf);
+                    Serial.println(F("  Type ? for full command reference"));
+                    break;
+            }
+            buf="";
+        } else { buf+=c; }
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SWITCH HANDLERS
+// ════════════════════════════════════════════════════════════════════
+void onSwitchClosed(float actAZ, float actEL) {
+    capturedPotAZ=readPotCounts(PIN_POT_AZ); capturedPotEL=readPotCounts(PIN_POT_EL);
+    holdAZ=actAZ; holdEL=actEL; azPickedUp=false; elPickedUp=false;
+    stowConfirmed=false; stowConfirmedMs=0;
+    waitingForSun=false; autoStowedAtMs=0; darkStartMs=0;
+    currentMode=POT; lastMode=POT;
+    Serial.println(F("[SWITCH] Manual — holding until pots move"));
+}
+
+void onSwitchOpened() {
+    currentMode=STOW_TO_TRACK; lastMode=TRACK;
+    stowConfirmed=false; stowConfirmedMs=0;
+    Serial.println(F("[SWITCH] Automatic — stow then TRACK"));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  MQTT CALLBACK
+// ════════════════════════════════════════════════════════════════════
+void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
+    if (strcmp(topic,TOPIC_COMMAND)!=0) return;
+    StaticJsonDocument<256> doc;
+    if (deserializeJson(doc,payload,length)) return;
+    if (doc.containsKey("heartbeat")) { lastHeartbeatMs=millis(); return; }
+    bool sw=(digitalRead(PIN_SWITCH)==LOW);
+    if (doc.containsKey("mode")) {
+        String m=doc["mode"].as<String>();
+        if      (m=="track")  { if(!sw){armTracking();lastMode=TRACK;currentMode=TRACK;Serial.println(F("Mode->TRACK"));} }
+        else if (m=="remote") { if(!sw){remoteAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);remoteEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);lastMode=REMOTE;currentMode=REMOTE;Serial.println(F("Mode->REMOTE"));} }
+        else if (m=="pot")    { lastMode=POT;currentMode=POT;capturedPotAZ=readPotCounts(PIN_POT_AZ);capturedPotEL=readPotCounts(PIN_POT_EL);holdAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);holdEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);azPickedUp=false;elPickedUp=false;Serial.println(F("Mode->POT")); }
+        else if (m=="stow")   { lastMode=STOW;currentMode=STOW;Serial.println(F("Mode->STOW")); }
+        else if (m=="estop")  { currentMode=ESTOP;Serial.println(F("Mode->ESTOP")); }
+        else if (m=="resume") {
+            if(sw&&(lastMode==TRACK||lastMode==REMOTE)){currentMode=POT;Serial.println(F("Mode->POT(sw)"));}
+            else{currentMode=lastMode;Serial.print(F("Mode->RESUME->"));Serial.println(lastMode==POT?"POT":lastMode==REMOTE?"REMOTE":lastMode==TRACK?"TRACK":"STOW");}
+        }
+    }
+    if (currentMode==REMOTE) {
+        if (doc.containsKey("az_setpoint")) remoteAZ=constrain(doc["az_setpoint"].as<float>(),-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+        if (doc.containsKey("el_setpoint")) remoteEL=constrain(doc["el_setpoint"].as<float>(),-EL_MAX_ANGLE,EL_MAX_ANGLE);
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  WIFI / MQTT
+// ════════════════════════════════════════════════════════════════════
+void startWiFi() {
+    Serial.println(F("WiFi: connecting to NETGEAR08..."));
+    WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+}
+
+bool connectMQTT() {
+    if (mqttClient.connected()) return true;
+    Serial.print(F("MQTT connecting..."));
+    if (mqttClient.connect(MQTT_CLIENT_ID,MQTT_USER,MQTT_PASS,TOPIC_STATUS,0,true,"offline")) {
+        mqttClient.subscribe(TOPIC_COMMAND);
+        mqttClient.publish(TOPIC_STATUS,"online",true);
+        Serial.println(F(" connected")); return true;
+    }
+    Serial.print(F(" failed rc=")); Serial.println(mqttClient.state()); return false;
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  TELEMETRY
+// ════════════════════════════════════════════════════════════════════
+void publishTelemetry(float cmdAZ, float cmdEL, float actAZ, float actEL,
+                      float errAZ, float errEL, bool jrkOK,
+                      uint16_t jrkErrAZ, uint16_t jrkErrEL) {
+    StaticJsonDocument<640> doc;
+    doc["az_cmd"]          = round(cmdAZ*10.0f)/10.0f;
+    doc["el_cmd"]          = round(cmdEL*10.0f)/10.0f;
+    doc["az_actual"]       = round(actAZ*10.0f)/10.0f;
+    doc["el_actual"]       = round(actEL*10.0f)/10.0f;
+    doc["az_error"]        = round(errAZ*10.0f)/10.0f;
+    doc["el_error"]        = round(errEL*10.0f)/10.0f;
+    doc["mode"]            = (currentMode==POT?"pot":currentMode==REMOTE?"remote":
+                              currentMode==STOW?"stow":currentMode==ESTOP?"estop":
+                              currentMode==TRACK?"track":
+                              currentMode==STOW_TO_TRACK?"stow_to_track":"unknown");
+    doc["jrk_ok"]          = jrkOK;
+    doc["jrk_az_ok"]       = (jrkErrAZ==0);
+    doc["jrk_el_ok"]       = (jrkErrEL==0);
+    doc["hw_manual"]       = (digitalRead(PIN_SWITCH)==LOW);
+    doc["dashboard_active"]= dashboardActive;
+    doc["uptime_s"]        = millis()/1000;
+    doc["wifi_rssi"]       = WiFi.RSSI();
+    doc["trk_e_az"]        = round(lastSense.E_az*1000.0f)/1000.0f;
+    doc["trk_e_el"]        = round(lastSense.E_el*1000.0f)/1000.0f;
+    doc["trk_irrad"]       = round(lastSense.S*1000.0f)/1000.0f;
+    doc["trk_valid"]       = lastSense.valid;
+    doc["trk_state"]       = (trkState==TRK_ACTIVE?"active":"frozen");
+    doc["waiting_for_sun"] = waitingForSun;
+    doc["panel_v"]         = round(panelVoltage*100.0f)/100.0f;
+    doc["panel_i"]         = round(panelCurrent*1000.0f)/1000.0f;
+    doc["panel_w"]         = round(panelPower*100.0f)/100.0f;
+    char buffer[640];
+    size_t len=serializeJson(doc,buffer);
+    mqttClient.publish(TOPIC_TELEMETRY,buffer,len);
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+
+    neo.begin(); neo.setBrightness(NEO_BRIGHTNESS);
+    neo.setPixelColor(0,C_RED); neo.show();
+
+    // Load saved tuning values from flash
+    nvsLoad();
+
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_Q1,           ADC_11db);
+    analogSetPinAttenuation(PIN_Q2,           ADC_11db);
+    analogSetPinAttenuation(PIN_Q3,           ADC_11db);
+    analogSetPinAttenuation(PIN_Q4,           ADC_11db);
+    analogSetPinAttenuation(PIN_PANEL_VOLTAGE,ADC_11db);
+    analogSetPinAttenuation(PIN_PANEL_CURRENT,ADC_11db);
+    analogSetPinAttenuation(PIN_POT_AZ,       ADC_11db);
+    analogSetPinAttenuation(PIN_POT_EL,       ADC_11db);
+    pinMode(PIN_SWITCH,INPUT_PULLUP);
+
+    Wire.begin(PIN_SDA,PIN_SCL); Wire.setClock(400000);
+
+    lcd.init(); lcd.backlight();
+    lcd.setCursor(0,0); lcd.print(F("DAST  v2.9 final    "));
+    lcd.setCursor(0,1); lcd.print(F("Initializing...     "));
+    lcd.setCursor(0,2); lcd.print(F("                    "));
+    lcd.setCursor(0,3); lcd.print(F("                    "));
+
+    Serial.println();
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  DAST v2.9 final — Dual Axis Solar Tracker"));
+    Serial.println(F("  NTP time | NVS persistence | Full serial tuning"));
+    Serial.println(F("  Type ? for complete command reference"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+
+    uint16_t sfAZ=jrkAZ.getScaledFeedback(), sfEL=jrkEL.getScaledFeedback();
+    Serial.print(F("  Jrk AZ: ")); Serial.println(sfAZ<=4095?F("OK"):F("NO RESPONSE"));
+    Serial.print(F("  Jrk EL: ")); Serial.println(sfEL<=4095?F("OK"):F("NO RESPONSE"));
+
+    // Switch debounce — USB connection can cause brief glitch on boot
+    delay(50);
+    bool sw1=(digitalRead(PIN_SWITCH)==LOW);
+    delay(50);
+    bool sw2=(digitalRead(PIN_SWITCH)==LOW);
+    prevSwitchManual=(sw1&&sw2);
+
+    if (prevSwitchManual) {
+        capturedPotAZ=readPotCounts(PIN_POT_AZ); capturedPotEL=readPotCounts(PIN_POT_EL);
+        holdAZ=scaledFeedbackToAngle(sfAZ,AZ_MAX_ANGLE);
+        holdEL=scaledFeedbackToAngle(sfEL,EL_MAX_ANGLE);
+        azPickedUp=false; elPickedUp=false;
+        currentMode=POT; lastMode=POT;
+        Serial.println(F("  Switch: MANUAL"));
+    } else {
+        currentMode=STOW; lastMode=STOW;
+        Serial.println(F("  Switch: AUTO — STOW"));
+    }
+
+    { float z=adcPinVolts(PIN_PANEL_CURRENT);
+      Serial.print(F("  Current zero pin: ")); Serial.print(z,4); Serial.println(F("V")); }
+    updatePanelReadings();
+    Serial.print(F("  Panel: ")); Serial.print(panelVoltage,2);
+    Serial.print(F("V  ")); Serial.print(panelCurrent,3);
+    Serial.print(F("A  ")); Serial.print(panelPower,2); Serial.println(F("W"));
+    Serial.println(F("  NVS values loaded from flash"));
+
+    mqttClient.setServer(MQTT_SERVER,MQTT_PORT);
+    mqttClient.setCallback(onMQTTMessage);
+    mqttClient.setBufferSize(640);
+    mqttClient.setKeepAlive(60);
+
+    startWiFi();
+    lastWifiAttempt=millis();
+
+    lcd.setCursor(0,1);
+    lcd.print(prevSwitchManual?F("Mode: MANUAL        "):F("Mode: STOW          "));
+    lcd.setCursor(0,3); lcd.print(F("WiFi: connecting... "));
+
+    printHelp();
+    Serial.println(F("Running — type ? for commands"));
+    Serial.println();
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ════════════════════════════════════════════════════════════════════
+void loop() {
+    static unsigned long lastLoop      = 0;
+    static unsigned long lastTelemetry = 0;
+    static unsigned long lastLCD       = 0;
+    static unsigned long lastCSV       = 0;
+
+    handleSerialTuning();
+    if (mqttClient.connected()) mqttClient.loop();
+
+    unsigned long now=millis();
+    if (now-lastLoop<LOOP_MS) return;
+    lastLoop=now;
+
+    // WiFi watchdog
+    bool wifiOK=(WiFi.status()==WL_CONNECTED);
+    if (!wifiOK) {
+        if (wifiWasConnected) { Serial.println(F("WiFi lost")); wifiWasConnected=false; }
+        if (now-lastWifiAttempt>WIFI_RETRY_MS) {
+            lastWifiAttempt=now; Serial.println(F("WiFi: retrying..."));
+            WiFi.disconnect(); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+        }
+    } else {
+        if (!wifiWasConnected) {
+            wifiWasConnected=true;
+            Serial.print(F("WiFi connected — IP: ")); Serial.println(WiFi.localIP());
+            // Sync NTP once WiFi connects
+            if (!ntpSynced) {
+                configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER);
+                struct tm t;
+                if (getLocalTime(&t, 5000)) {
+                    ntpSynced=true;
+                    Serial.print(F("NTP synced — time: ")); Serial.println(getTimeStr());
+                } else {
+                    Serial.println(F("NTP sync failed — using uptime"));
+                }
+            }
+        }
+    }
+
+    // MQTT watchdog
+    bool mqttOK=mqttClient.connected();
+    if (!mqttOK&&wifiOK&&(now-lastMqttAttempt>MQTT_RECONNECT_MS)) {
+        lastMqttAttempt=now; mqttOK=connectMQTT();
+    }
+
+    updatePanelReadings();
+
+    // Update S every loop regardless of mode — shows on LCD row 3
+    {
+        SenseResult sGlobal=readSensors();
+        lastSense.S=sGlobal.S;
+    }
+
+    float actAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);
+    float actEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);
+
+    bool switchManual=(digitalRead(PIN_SWITCH)==LOW);
+    if ( switchManual&&!prevSwitchManual) onSwitchClosed(actAZ,actEL);
+    if (!switchManual&& prevSwitchManual) onSwitchOpened();
+    prevSwitchManual=switchManual;
+
+    int curPotAZ=0,curPotEL=0;
+    if (currentMode==POT) {
+        curPotAZ=readPotCounts(PIN_POT_AZ); curPotEL=readPotCounts(PIN_POT_EL);
+        if (!azPickedUp&&abs(curPotAZ-capturedPotAZ)>POT_PICKUP_COUNTS) { azPickedUp=true; Serial.println(F("[POT] AZ picked up")); }
+        if (!elPickedUp&&abs(curPotEL-capturedPotEL)>POT_PICKUP_COUNTS) { elPickedUp=true; Serial.println(F("[POT] EL picked up")); }
+    }
+
+    // Stow-to-track
+    if (currentMode==STOW_TO_TRACK) {
+        jrkAZ.setTarget(angleToTarget(0.0f,AZ_MAX_ANGLE));
+        jrkEL.setTarget(angleToTarget(0.0f,EL_MAX_ANGLE));
+        if (!stowConfirmed) {
+            if (bothAxesAtStow()) {
+                stowConfirmed=true; stowConfirmedMs=now;
+                if (waitingForSun) autoStowedAtMs=now;
+                Serial.println(F("[STOW_TO_TRACK] Confirmed — 3s"));
+            }
+        } else if (now-stowConfirmedMs>=STOW_TO_TRACK_DELAY_MS) {
+            if (!waitingForSun) { armTracking(); currentMode=TRACK; lastMode=TRACK; Serial.println(F("[STOW_TO_TRACK] -> TRACK")); }
+            else { currentMode=TRACK; lastMode=TRACK; Serial.println(F("[STOW_TO_TRACK] -> TRACK (waiting for sun)")); }
+        }
+        uint16_t eAZ=jrkAZ.getErrorFlagsHalting(), eEL=jrkEL.getErrorFlagsHalting();
+        updateNeoPixel((eAZ==0)&&(eEL==0),mqttOK,!wifiOK);
+        if (now-lastLCD>LCD_UPDATE_MS) { lastLCD=now; updateLCD(actAZ,actEL,wifiOK,mqttOK); }
+        return;
+    }
+
+    // Commanded angles
+    float cmdAZ=0.0f, cmdEL=0.0f;
+    switch(currentMode) {
+        case TRACK:
+            runTracking(now);
+            cmdAZ=trkCmdAZ; cmdEL=trkCmdEL;
+            break;
+        case STOW:
+            if (waitingForSun) runTracking(now);
+            cmdAZ=0.0f; cmdEL=0.0f;
+            break;
+        case POT: {
+            float pAZ=countsToAngle(curPotAZ,AZ_COUNT_ZERO,AZ_MAX_ANGLE);
+            float pEL=countsToAngle(curPotEL,EL_COUNT_ZERO,EL_MAX_ANGLE);
+            cmdAZ=azPickedUp?pAZ:holdAZ; cmdEL=elPickedUp?pEL:holdEL;
+            break;
+        }
+        case REMOTE: cmdAZ=remoteAZ; cmdEL=remoteEL; break;
+        case ESTOP:  cmdAZ=heldAZ;   cmdEL=heldEL;   break;
+        default:     cmdAZ=0.0f;     cmdEL=0.0f;     break;
+    }
+
+    jrkAZ.setTarget(angleToTarget(cmdAZ,AZ_MAX_ANGLE));
+    jrkEL.setTarget(angleToTarget(cmdEL,EL_MAX_ANGLE));
+    if (currentMode!=ESTOP) { heldAZ=actAZ; heldEL=actEL; }
+
+    float errAZ=actAZ-cmdAZ, errEL=actEL-cmdEL;
+
+    uint16_t jrkErrAZ=jrkAZ.getErrorFlagsHalting();
+    uint16_t jrkErrEL=jrkEL.getErrorFlagsHalting();
+    if (jrkErrAZ) { Serial.print(F("AZ Jrk err: 0x")); Serial.println(jrkErrAZ,HEX); }
+    if (jrkErrEL) { Serial.print(F("EL Jrk err: 0x")); Serial.println(jrkErrEL,HEX); }
+    bool jrkOK=(jrkErrAZ==0)&&(jrkErrEL==0);
+
+    dashboardActive=(lastHeartbeatMs>0)&&((now-lastHeartbeatMs)<HEARTBEAT_TIMEOUT_MS);
+    updateNeoPixel(jrkOK,mqttOK,!wifiOK);
+
+    if (now-lastLCD>LCD_UPDATE_MS) { lastLCD=now; updateLCD(actAZ,actEL,wifiOK,mqttOK); }
+
+    if (mqttOK&&(now-lastTelemetry>TELEMETRY_MS)) {
+        lastTelemetry=now;
+        publishTelemetry(cmdAZ,cmdEL,actAZ,actEL,errAZ,errEL,jrkOK,jrkErrAZ,jrkErrEL);
+    }
+
+    // CSV logging — toggled by l command
+    if (csvLogging&&(now-lastCSV>TELEMETRY_MS)) {
+        lastCSV=now;
+        unsigned long darkSec=(!lastSense.valid&&darkStartMs>0)?(now-darkStartMs)/1000:0;
+        String ts=getTimestampCSV();
+        Serial.print(ts);                    Serial.print(",");
+        Serial.print(currentMode==POT?"pot":currentMode==REMOTE?"remote":
+                     currentMode==STOW?"stow":currentMode==ESTOP?"estop":
+                     currentMode==TRACK?"track":
+                     currentMode==STOW_TO_TRACK?"stowin":"unk"); Serial.print(",");
+        Serial.print(cmdAZ,2);               Serial.print(",");
+        Serial.print(actAZ,2);               Serial.print(",");
+        Serial.print(errAZ,2);               Serial.print(",");
+        Serial.print(cmdEL,2);               Serial.print(",");
+        Serial.print(actEL,2);               Serial.print(",");
+        Serial.print(errEL,2);               Serial.print(",");
+        Serial.print(lastSense.E_az,3);      Serial.print(",");
+        Serial.print(lastSense.E_el,3);      Serial.print(",");
+        Serial.print(lastSense.S,3);         Serial.print(",");
+        Serial.print(lastSense.valid?1:0);   Serial.print(",");
+        Serial.print(trkState==TRK_ACTIVE?"active":"frozen"); Serial.print(",");
+        Serial.print(panelVoltage,2);        Serial.print(",");
+        Serial.print(panelCurrent,3);        Serial.print(",");
+        Serial.print(panelPower,2);          Serial.print(",");
+        Serial.print(now/1000);              Serial.print(",");
+        Serial.print(darkSec);               Serial.print(",");
+        Serial.println(waitingForSun?1:0);
+    }
+}
