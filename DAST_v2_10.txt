@@ -1,0 +1,1474 @@
+// ════════════════════════════════════════════════════════════════════
+//  DAST — Dual Axis Solar Tracker  v2.10
+//  Espressif ESP32-S3 DevKitC-1
+//  Jrk G2 21v3 x2  |  Mosquitto MQTT  |  EC2 3.130.168.101
+//  AD8210 + Dale RS-2B 0.1Ohm  |  LCD 20x4 at 0x27
+//
+//  v2.10 changes from v2.9:
+//    - Solar position calculator (NOAA algorithm)
+//        Uses NTP time + stored lat/lon coordinates
+//        Calculates true sun azimuth and elevation each loop
+//        Adds sol_az, sol_el, sol_az_dast, sol_el_dast,
+//        abs_az_error, abs_el_error to CSV
+//    - CAL mode — LDR offset calibration
+//        Type cal to enter, full instruction set prints automatically
+//        c0  capture: reads LDR errors, computes solar position,
+//            calculates absolute pointing error, saves offsets to NVS
+//        ct  test: rate controller active with offsets applied
+//        cx  exit: stow then TRACK with offsets active
+//        cs<val><dir>  log shadow measurement e.g. cs10SE
+//    - LDR offset correction
+//        corrected_E_az = E_az - az_ldr_offset
+//        corrected_E_el = E_el - el_ldr_offset
+//        Offsets saved to NVS — survive uploads
+//        ox<val> manual AZ offset override
+//        oy<val> manual EL offset override
+//    - Coordinate entry via serial — saved to NVS
+//        lat<val>  latitude decimal degrees positive north
+//        lon<val>  longitude decimal degrees negative west
+//        Confirmed test coordinates: 42.6985N  88.9912W
+//    - All v2.9 features retained
+//
+//  SERIAL COMMANDS (Both NL & CR, 115200 baud):
+//    TRACKING:
+//      r<val>   AZ rate deg/sec              e.g. r10.0
+//      e<val>   EL rate deg/sec              e.g. e15.0
+//      d<val>   Deadband                     e.g. d0.02
+//      g<val>   Gate threshold               e.g. g0.31
+//      h<val>   Gate hysteresis              e.g. h0.5
+//      q<val>   Reacquire gate               e.g. q8.0
+//      t<val>   Dark timeout minutes         e.g. t10
+//    CALIBRATION:
+//      cal      Enter/exit CAL mode (prints full instructions)
+//      c0       Capture LDR offsets at current null position
+//      ct       Test offsets — rate controller active in CAL
+//      cx       Exit CAL — stow then TRACK
+//      cs<val><dir>  Log shadow e.g. cs10SE cs5N
+//      ox<val>  Manual AZ LDR offset         e.g. ox0.045
+//      oy<val>  Manual EL LDR offset         e.g. oy0.012
+//    COORDINATES:
+//      lat<val> Latitude decimal deg         e.g. lat42.6985
+//      lon<val> Longitude decimal deg W neg  e.g. lon-88.9912
+//    POWER:
+//      c<val>   VCAL voltage trim            e.g. c1.178
+//      a<val>   ICAL current trim            e.g. a1.0
+//      n<val>   Current zero offset V        e.g. n0.012
+//    DATA:
+//      l        Toggle CSV logging
+//      z        Re-arm tracking from current position
+//      v        Tracking snapshot
+//      ?        Full command reference
+//      !        Reset all to defaults
+//
+//  CAL MODE PROCEDURE:
+//    1. Type cal — enters CAL, pots control position
+//    2. Use pots to aim panel until shadow is visually eliminated
+//    3. Type c0 — captures LDR offsets and prints calibration report
+//       Shows: raw E_az/E_el, computed offsets, solar position,
+//       absolute pointing error in degrees
+//    4. Type ct — test mode, rate controller active with offsets
+//       Panel should now track to true null
+//    5. If still off, type c0 again to refine offsets
+//       Or type ox/oy to manually adjust
+//    6. Type cs<val><dir> to log any shadow observation
+//    7. Type cx — exits CAL, stows, transitions to TRACK
+//
+//  SOLAR POSITION COORDINATE SYSTEM:
+//    sol_az     — azimuth degrees from north clockwise (standard)
+//    sol_el     — elevation degrees above horizon (standard)
+//    sol_az_dast — DAST coordinates: 0=south, positive=east
+//                  sol_az_dast = 180 - sol_az
+//    sol_el_dast — same as sol_el (elevation = DAST EL angle)
+//    abs_az_error = act_az - sol_az_dast (positive = pointing east of sun)
+//    abs_el_error = act_el - sol_el_dast (positive = pointing south of sun)
+//
+//  CSV COLUMNS (25 total):
+//    timestamp, mode,
+//    az_cmd, az_actual, az_error, el_cmd, el_actual, el_error,
+//    trk_e_az, trk_e_el, trk_irrad, trk_valid, trk_state,
+//    panel_v, panel_i, panel_w,
+//    sol_az, sol_el, sol_az_dast, sol_el_dast,
+//    abs_az_error, abs_el_error,
+//    uptime_s, dark_timer_s, waiting_for_sun
+//
+//  CALIBRATION CONFIRMED:
+//    AZ_COUNT_ZERO=2176  EL_COUNT_ZERO=2175
+//    AZ_MAX=90deg  EL_MAX=80deg
+//    Lat=42.6985N  Lon=-88.9912W (UW-Platteville Busby Hall area)
+// ════════════════════════════════════════════════════════════════════
+
+// #define USE_PHOTODIODE
+#define USE_LDR
+
+#if defined(USE_PHOTODIODE) && defined(USE_LDR)
+  #error "Define either USE_PHOTODIODE or USE_LDR, not both."
+#endif
+#if !defined(USE_PHOTODIODE) && !defined(USE_LDR)
+  #error "Define either USE_PHOTODIODE or USE_LDR, neither selected."
+#endif
+
+#include <Wire.h>
+#include <JrkG2.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#include <time.h>
+#include <math.h>
+
+// ── LCD ──────────────────────────────────────────────────────────────
+#define LCD_I2C_ADDR 0x27
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 20, 4);
+
+// ── NVS ──────────────────────────────────────────────────────────────
+Preferences prefs;
+
+// ── NETWORK ──────────────────────────────────────────────────────────
+const char* WIFI_SSID       = "NETGEAR08";
+const char* WIFI_PASSWORD   = "pinktrumpet867";
+const char* MQTT_SERVER     = "3.130.168.101";
+const int   MQTT_PORT       = 1883;
+const char* MQTT_USER       = "dast";
+const char* MQTT_PASS       = "unREALGems@419";
+const char* MQTT_CLIENT_ID  = "DAST-ESP32S3-DevKit";
+const char* TOPIC_TELEMETRY = "dast/telemetry";
+const char* TOPIC_COMMAND   = "dast/command";
+const char* TOPIC_STATUS    = "dast/status";
+
+// ── NTP ──────────────────────────────────────────────────────────────
+const char* NTP_SERVER = "pool.ntp.org";
+const long  GMT_OFFSET = -6 * 3600;
+const int   DST_OFFSET = 3600;
+
+// ── JRK G2 ───────────────────────────────────────────────────────────
+JrkG2I2C jrkAZ(11);
+JrkG2I2C jrkEL(12);
+
+// ── PINS ─────────────────────────────────────────────────────────────
+const int PIN_SDA           = 11;
+const int PIN_SCL           = 12;
+const int PIN_NEOPIXEL      = 38;
+const int PIN_Q1            = 1;
+const int PIN_Q2            = 2;
+const int PIN_Q3            = 3;
+const int PIN_Q4            = 4;
+const int PIN_PANEL_VOLTAGE = 5;
+const int PIN_PANEL_CURRENT = 6;
+const int PIN_SWITCH        = 7;
+const int PIN_POT_AZ        = 8;
+const int PIN_POT_EL        = 9;
+
+// ── NEOPIXEL ─────────────────────────────────────────────────────────
+Adafruit_NeoPixel neo(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+#define NEO_BRIGHTNESS 40
+#define C_RED     neo.Color(180,  0,  0)
+#define C_ORANGE  neo.Color(180, 50,  0)
+#define C_AMBER   neo.Color(180, 80,  0)
+#define C_GREEN   neo.Color(  0,180,  0)
+#define C_BLUE    neo.Color(  0,  0,180)
+#define C_PURPLE  neo.Color(100,  0,180)
+#define C_MAGENTA neo.Color(180,  0,180)
+#define C_WHITE   neo.Color(180,180,180)
+#define C_CYAN    neo.Color(  0,180,180)
+#define C_OFF     neo.Color(  0,  0,  0)
+
+// ── ADC ──────────────────────────────────────────────────────────────
+const int NUM_SAMPLES = 8;
+const int TRACK_SAMP  = 32;
+
+// ── FIXED HARDWARE ───────────────────────────────────────────────────
+const float INA_OPAMP_GAIN = 20.0f;
+const float SHUNT_OHMS     =  0.1f;
+const float VDIV_RATIO     = 20.17f;
+
+// ── TUNING DEFAULTS ───────────────────────────────────────────────────
+const float DEF_VCAL           =  1.178f;
+const float DEF_ICAL           =  1.0f;
+const float DEF_CURRENT_ZERO_V =  0.0f;
+const float DEF_RATE_AZ        = 10.0f;
+const float DEF_RATE_EL        = 15.0f;
+const float DEF_DB             =  0.02f;
+const float DEF_GATE           =  0.31f;
+const float DEF_GATE_HYST      =  0.5f;
+const float DEF_REACQUIRE_GATE =  8.0f;
+const float DEF_DARK_TIMEOUT   = 10.0f;
+const float DEF_AZ_LDR_OFFSET  =  0.0f;
+const float DEF_EL_LDR_OFFSET  =  0.0f;
+const float DEF_LAT             = 42.6985f;
+const float DEF_LON             = -88.9912f;
+
+// ── LIVE TUNING — loaded from NVS ────────────────────────────────────
+float vcal              = DEF_VCAL;
+float ical              = DEF_ICAL;
+float currentZeroV      = DEF_CURRENT_ZERO_V;
+float tuneRateAZ        = DEF_RATE_AZ;
+float tuneRateEL        = DEF_RATE_EL;
+float tuneDB            = DEF_DB;
+float tuneGate          = DEF_GATE;
+float tuneGateHyst      = DEF_GATE_HYST;
+float tuneReacquireGate = DEF_REACQUIRE_GATE;
+float tuneDarkTimeout   = DEF_DARK_TIMEOUT;
+float azLdrOffset       = DEF_AZ_LDR_OFFSET;
+float elLdrOffset       = DEF_EL_LDR_OFFSET;
+float siteLat           = DEF_LAT;
+float siteLon           = DEF_LON;
+
+// ── AXIS CALIBRATION ─────────────────────────────────────────────────
+const int   POT_COUNT_MIN     = 0;
+const int   POT_COUNT_MAX     = 4095;
+const int   AZ_COUNT_ZERO     = 2176;
+const int   EL_COUNT_ZERO     = 2175;
+const int   POT_PICKUP_COUNTS = 50;
+const float AZ_MAX_ANGLE      = 90.0f;
+const float EL_MAX_ANGLE      = 80.0f;
+const int   JRK_MIN           = 0;
+const int   JRK_MAX           = 4095;
+const int   STOW_TOL          = 30;
+
+// ── TIMING ───────────────────────────────────────────────────────────
+const unsigned long STOW_TO_TRACK_DELAY_MS = 3000UL;
+const unsigned long REACQUIRE_DELAY_MS     = 5000UL;
+const unsigned long HEARTBEAT_TIMEOUT_MS   = 90000UL;
+const unsigned long LOOP_MS                = 100UL;
+const unsigned long MQTT_RECONNECT_MS      = 30000UL;
+const unsigned long WIFI_RETRY_MS          = 15000UL;
+const unsigned long TELEMETRY_MS           = 2000UL;
+const unsigned long LCD_UPDATE_MS          = 500UL;
+
+// ── OPERATING MODE ───────────────────────────────────────────────────
+enum Mode { POT, REMOTE, STOW, ESTOP, TRACK, STOW_TO_TRACK, CAL };
+Mode currentMode = STOW;
+Mode lastMode    = STOW;
+
+// ── CAL STATE ────────────────────────────────────────────────────────
+bool calTestActive = false;  // true when ct command issued in CAL
+
+// ── STATE ────────────────────────────────────────────────────────────
+float remoteAZ = 0.0f, remoteEL = 0.0f;
+float heldAZ   = 0.0f, heldEL   = 0.0f;
+float holdAZ   = 0.0f, holdEL   = 0.0f;
+
+bool  prevSwitchManual = false;
+int   capturedPotAZ    = 0, capturedPotEL = 0;
+bool  azPickedUp       = false, elPickedUp = false;
+
+unsigned long stowConfirmedMs  = 0;
+bool          stowConfirmed    = false;
+unsigned long lastHeartbeatMs  = 0;
+bool          dashboardActive  = false;
+
+float panelVoltage = 0.0f, panelCurrent = 0.0f, panelPower = 0.0f;
+
+bool          wifiWasConnected  = false;
+unsigned long lastWifiAttempt   = 0;
+unsigned long lastMqttAttempt   = 0;
+bool          printTrackingSnap = false;
+bool          csvLogging        = false;
+bool          ntpSynced         = false;
+
+// ── AUTO-STOW / REACQUIRE ────────────────────────────────────────────
+bool          waitingForSun  = false;
+unsigned long darkStartMs    = 0;
+unsigned long autoStowedAtMs = 0;
+bool          gateWasOpen    = false;
+
+WiFiClient   wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+// ── TRACKING STATE ───────────────────────────────────────────────────
+struct SenseResult { float E_az, E_el, S; bool valid; };
+struct TrackAxis   { float baseDeg; };
+
+TrackAxis   trackAZ   = { 0.0f };
+TrackAxis   trackEL   = { 0.0f };
+SenseResult lastSense = { 0.0f, 0.0f, 0.0f, false };
+float       trkCmdAZ  = 0.0f, trkCmdEL = 0.0f;
+
+enum TrackState { TRK_ACTIVE, TRK_FROZEN };
+TrackState    trkState  = TRK_FROZEN;
+unsigned long trkLossMs = 0;
+
+// ── SOLAR POSITION STATE ─────────────────────────────────────────────
+float solAz      = 0.0f;  // azimuth from north clockwise (degrees)
+float solEl      = 0.0f;  // elevation above horizon (degrees)
+float solAzDast  = 0.0f;  // DAST coordinates: 0=south, positive=east
+float solElDast  = 0.0f;  // same as solEl
+
+
+// ════════════════════════════════════════════════════════════════════
+//  NVS
+// ════════════════════════════════════════════════════════════════════
+void nvsLoad() {
+    prefs.begin("dast", true);
+    tuneRateAZ        = prefs.getFloat("rateAZ",    DEF_RATE_AZ);
+    tuneRateEL        = prefs.getFloat("rateEL",    DEF_RATE_EL);
+    tuneDB            = prefs.getFloat("db",        DEF_DB);
+    tuneGate          = prefs.getFloat("gate",      DEF_GATE);
+    tuneGateHyst      = prefs.getFloat("gateHyst",  DEF_GATE_HYST);
+    tuneReacquireGate = prefs.getFloat("reacqGate", DEF_REACQUIRE_GATE);
+    tuneDarkTimeout   = prefs.getFloat("darkTO",    DEF_DARK_TIMEOUT);
+    vcal              = prefs.getFloat("vcal",      DEF_VCAL);
+    ical              = prefs.getFloat("ical",      DEF_ICAL);
+    currentZeroV      = prefs.getFloat("czero",     DEF_CURRENT_ZERO_V);
+    azLdrOffset       = prefs.getFloat("azOff",     DEF_AZ_LDR_OFFSET);
+    elLdrOffset       = prefs.getFloat("elOff",     DEF_EL_LDR_OFFSET);
+    siteLat           = prefs.getFloat("lat",       DEF_LAT);
+    siteLon           = prefs.getFloat("lon",       DEF_LON);
+    prefs.end();
+}
+
+void nvsSave() {
+    prefs.begin("dast", false);
+    prefs.putFloat("rateAZ",    tuneRateAZ);
+    prefs.putFloat("rateEL",    tuneRateEL);
+    prefs.putFloat("db",        tuneDB);
+    prefs.putFloat("gate",      tuneGate);
+    prefs.putFloat("gateHyst",  tuneGateHyst);
+    prefs.putFloat("reacqGate", tuneReacquireGate);
+    prefs.putFloat("darkTO",    tuneDarkTimeout);
+    prefs.putFloat("vcal",      vcal);
+    prefs.putFloat("ical",      ical);
+    prefs.putFloat("czero",     currentZeroV);
+    prefs.putFloat("azOff",     azLdrOffset);
+    prefs.putFloat("elOff",     elLdrOffset);
+    prefs.putFloat("lat",       siteLat);
+    prefs.putFloat("lon",       siteLon);
+    prefs.end();
+}
+
+void nvsReset() {
+    tuneRateAZ=DEF_RATE_AZ; tuneRateEL=DEF_RATE_EL;
+    tuneDB=DEF_DB; tuneGate=DEF_GATE; tuneGateHyst=DEF_GATE_HYST;
+    tuneReacquireGate=DEF_REACQUIRE_GATE; tuneDarkTimeout=DEF_DARK_TIMEOUT;
+    vcal=DEF_VCAL; ical=DEF_ICAL; currentZeroV=DEF_CURRENT_ZERO_V;
+    azLdrOffset=DEF_AZ_LDR_OFFSET; elLdrOffset=DEF_EL_LDR_OFFSET;
+    siteLat=DEF_LAT; siteLon=DEF_LON;
+    nvsSave();
+    Serial.println(F("  All values reset to defaults and saved"));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  NTP TIME
+// ════════════════════════════════════════════════════════════════════
+String getTimeStr() {
+    struct tm t;
+    if (!ntpSynced || !getLocalTime(&t)) return String("--:--:--");
+    char buf[10]; strftime(buf,10,"%H:%M:%S",&t);
+    return String(buf);
+}
+
+String getTimestampCSV() {
+    struct tm t;
+    if (!ntpSynced || !getLocalTime(&t)) return String(millis());
+    char buf[24]; strftime(buf,24,"%Y-%m-%dT%H:%M:%S",&t);
+    return String(buf);
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SOLAR POSITION CALCULATOR
+//  NOAA algorithm — accurate to <0.01 degrees for this latitude/date
+//
+//  Outputs:
+//    sol_az  — azimuth degrees from north clockwise (0=N 90=E 180=S 270=W)
+//    sol_el  — elevation degrees above horizon
+//
+//  DAST coordinate conversion:
+//    sol_az_dast = 180 - sol_az  (0=south, positive=east, negative=west)
+//    sol_el_dast = sol_el        (elevation = DAST EL angle)
+// ════════════════════════════════════════════════════════════════════
+void calcSolarPosition(float lat_deg, float lon_deg,
+                       float* out_az, float* out_el) {
+    struct tm t;
+    if (!ntpSynced || !getLocalTime(&t)) {
+        *out_az = 0.0f; *out_el = 0.0f; return;
+    }
+
+    int year  = t.tm_year + 1900;
+    int month = t.tm_mon  + 1;
+    int day   = t.tm_mday;
+    float hour_utc = t.tm_hour + t.tm_min/60.0f + t.tm_sec/3600.0f;
+    // Convert local time back to UTC (undo configTime offset)
+    // configTime used GMT_OFFSET=-6*3600 + DST=3600 -> net -5h
+    hour_utc = fmodf(hour_utc + 5.0f, 24.0f);
+
+    // Julian Day Number
+    float A = floorf((14.0f - month) / 12.0f);
+    float Y = year + 4800.0f - A;
+    float M = month + 12.0f * A - 3.0f;
+    float JDN = day + floorf((153.0f*M+2.0f)/5.0f)
+              + 365.0f*Y + floorf(Y/4.0f)
+              - floorf(Y/100.0f) + floorf(Y/400.0f) - 32045.0f;
+    float JD = JDN + (hour_utc - 12.0f) / 24.0f;
+
+    // Julian centuries from J2000.0
+    float T = (JD - 2451545.0f) / 36525.0f;
+
+    // Geometric mean longitude and anomaly (degrees)
+    float L0 = fmodf(280.46646f + T*(36000.76983f + T*0.0003032f), 360.0f);
+    float M0 = fmodf(357.52911f + T*(35999.05029f - T*0.0001537f), 360.0f);
+    float Mrad = M0 * DEG_TO_RAD;
+
+    // Equation of center
+    float C = (1.914602f - T*(0.004817f + 0.000014f*T)) * sinf(Mrad)
+            + (0.019993f - 0.000101f*T) * sinf(2.0f*Mrad)
+            + 0.000289f * sinf(3.0f*Mrad);
+
+    float sunLon = L0 + C;
+    float omega  = 125.04f - 1934.136f * T;
+    float lambda = sunLon - 0.00569f - 0.00478f * sinf(omega * DEG_TO_RAD);
+    float lambdaRad = lambda * DEG_TO_RAD;
+
+    // Obliquity of ecliptic
+    float eps0 = 23.0f + (26.0f + (21.448f - T*(46.815f + T*(0.00059f - T*0.001813f)))/60.0f)/60.0f;
+    float eps  = eps0 + 0.00256f * cosf(omega * DEG_TO_RAD);
+    float epsRad = eps * DEG_TO_RAD;
+
+    // Declination
+    float decl = asinf(sinf(epsRad) * sinf(lambdaRad));
+
+    // Equation of time (minutes)
+    float y2 = tanf(epsRad/2.0f) * tanf(epsRad/2.0f);
+    float ecc = 0.016708634f - T*(0.000042037f + 0.0000001267f*T);
+    float EqT = 4.0f * RAD_TO_DEG * (
+        y2*sinf(2.0f*L0*DEG_TO_RAD)
+        - 2.0f*ecc*sinf(Mrad)
+        + 4.0f*ecc*y2*sinf(Mrad)*cosf(2.0f*L0*DEG_TO_RAD)
+        - 0.5f*y2*y2*sinf(4.0f*L0*DEG_TO_RAD)
+        - 1.25f*ecc*ecc*sinf(2.0f*Mrad));
+
+    // True solar time (minutes) — lon_deg positive east
+    float TST = fmodf(hour_utc*60.0f + EqT + 4.0f*lon_deg, 1440.0f);
+
+    // Hour angle
+    float HA = (TST/4.0f < 0.0f) ? TST/4.0f + 180.0f : TST/4.0f - 180.0f;
+    float HARad = HA * DEG_TO_RAD;
+    float latRad = lat_deg * DEG_TO_RAD;
+
+    // Solar zenith
+    float cosZ = sinf(latRad)*sinf(decl) + cosf(latRad)*cosf(decl)*cosf(HARad);
+    float zenith = acosf(constrain(cosZ, -1.0f, 1.0f)) * RAD_TO_DEG;
+    *out_el = 90.0f - zenith;
+
+    // Solar azimuth (from north clockwise)
+    if (*out_el < -0.5f) { *out_az = 0.0f; return; }  // below horizon
+    float cosAz = (sinf(latRad)*cosf(zenith*DEG_TO_RAD) - sinf(decl))
+                / (cosf(latRad)*sinf(zenith*DEG_TO_RAD) + 1e-10f);
+    float az = acosf(constrain(cosAz, -1.0f, 1.0f)) * RAD_TO_DEG;
+    *out_az = (HA > 0.0f) ? fmodf(az + 180.0f, 360.0f) : fmodf(540.0f - az, 360.0f);
+}
+
+void updateSolarPosition() {
+    calcSolarPosition(siteLat, siteLon, &solAz, &solEl);
+    // Convert to DAST coordinates
+    solAzDast = 180.0f - solAz;
+    if (solAzDast >  180.0f) solAzDast -= 360.0f;
+    if (solAzDast < -180.0f) solAzDast += 360.0f;
+    solElDast = 90.0f - solEl;
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SENSOR — PHOTODIODE
+// ════════════════════════════════════════════════════════════════════
+#ifdef USE_PHOTODIODE
+bool gateActive = false;
+float trackAdcV(int pin) {
+    uint32_t acc=0;
+    for(int i=0;i<TRACK_SAMP;i++) acc+=analogReadMilliVolts(pin);
+    return (float)acc/TRACK_SAMP/1000.0f;
+}
+SenseResult readSensors() {
+    float q1=trackAdcV(PIN_Q1),q2=trackAdcV(PIN_Q2);
+    float q3=trackAdcV(PIN_Q3),q4=trackAdcV(PIN_Q4);
+    float saz=q1+q2,sel=q3+q4,S=saz+sel;
+    float thr=gateActive?(tuneGate-tuneGateHyst):tuneGate;
+    gateActive=(S>thr);
+    SenseResult r; r.S=S; r.valid=gateActive;
+    r.E_az=(saz>0.05f)?(q1-q2)/saz:0.0f;
+    r.E_el=(sel>0.05f)?(q3-q4)/sel:0.0f;
+    // Apply LDR offsets
+    r.E_az -= azLdrOffset;
+    r.E_el -= elLdrOffset;
+    r.E_az=constrain(r.E_az,-1.0f,1.0f);
+    r.E_el=constrain(r.E_el,-1.0f,1.0f);
+    return r;
+}
+#endif
+
+// ════════════════════════════════════════════════════════════════════
+//  SENSOR — LDR
+//  Bright=LOW  Shadow=HIGH  Gate opens when S < tuneGate
+//  LDR offsets applied after normalization — corrects sensor imbalance
+// ════════════════════════════════════════════════════════════════════
+#ifdef USE_LDR
+bool gateActive = false;
+float trackAdcV(int pin) {
+    uint32_t acc=0;
+    for(int i=0;i<TRACK_SAMP;i++) acc+=analogReadMilliVolts(pin);
+    return (float)acc/TRACK_SAMP/1000.0f;
+}
+SenseResult readSensors() {
+    float q1=trackAdcV(PIN_Q1),q2=trackAdcV(PIN_Q2);
+    float q3=trackAdcV(PIN_Q3),q4=trackAdcV(PIN_Q4);
+    float east=q1+q2,west=q3+q4,north=q1+q3,south=q2+q4;
+    float S=q1+q2+q3+q4;
+    float thr=gateActive?(tuneGate+tuneGateHyst):tuneGate;
+    gateActive=(S<thr);
+    SenseResult r; r.S=S; r.valid=gateActive;
+    float Sf=(S>0.02f)?S:0.02f;
+    // Raw errors
+    r.E_az=constrain((west-east)/Sf,-1.0f,1.0f);
+    r.E_el=constrain((south-north)/Sf,-1.0f,1.0f);
+    // Apply LDR offset correction
+    r.E_az=constrain(r.E_az-azLdrOffset,-1.0f,1.0f);
+    r.E_el=constrain(r.E_el-elLdrOffset,-1.0f,1.0f);
+    return r;
+}
+#endif
+
+
+// ════════════════════════════════════════════════════════════════════
+//  RATE CONTROLLER + AUTO-STOW / REACQUIRE
+// ════════════════════════════════════════════════════════════════════
+void runTracking(uint32_t now) {
+    SenseResult s=readSensors();
+    lastSense=s;
+    float dt=LOOP_MS/1000.0f;
+    unsigned long darkTimeoutMs=(unsigned long)(tuneDarkTimeout*60000.0f);
+
+    // Reacquire while waiting for sun
+    if (waitingForSun) {
+        bool partialSun=(s.S<tuneReacquireGate);
+        if (partialSun&&autoStowedAtMs>0) {
+            unsigned long settled=now-autoStowedAtMs;
+            if (settled>=REACQUIRE_DELAY_MS) {
+                waitingForSun=false; gateWasOpen=false;
+                darkStartMs=0; autoStowedAtMs=0;
+                Serial.println(F("[AUTO] Sun detected — reacquiring"));
+                uint16_t sfAZ=jrkAZ.getScaledFeedback();
+                uint16_t sfEL=jrkEL.getScaledFeedback();
+                trackAZ.baseDeg=scaledFeedbackToAngle(sfAZ,AZ_MAX_ANGLE);
+                trackEL.baseDeg=scaledFeedbackToAngle(sfEL,EL_MAX_ANGLE);
+                trkState=TRK_FROZEN; trkCmdAZ=trackAZ.baseDeg; trkCmdEL=trackEL.baseDeg;
+                currentMode=STOW_TO_TRACK; lastMode=TRACK;
+                stowConfirmed=false; stowConfirmedMs=0;
+            } else {
+                static unsigned long lastMsg=0;
+                if (now-lastMsg>1000) {
+                    lastMsg=now;
+                    Serial.print(F("[AUTO] Partial sun — reacquire in "));
+                    Serial.print((REACQUIRE_DELAY_MS-(now-autoStowedAtMs))/1000);
+                    Serial.println(F("s"));
+                }
+            }
+        }
+        trkCmdAZ=constrain(trackAZ.baseDeg,-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+        trkCmdEL=constrain(trackEL.baseDeg,-EL_MAX_ANGLE,EL_MAX_ANGLE);
+        return;
+    }
+
+    if (s.valid) {
+        if (!gateWasOpen) { gateWasOpen=true; darkStartMs=0; }
+        if (trkState!=TRK_ACTIVE) { Serial.println(F("[TRACK] ACTIVE")); trkState=TRK_ACTIVE; }
+        trkLossMs=0;
+        float errAZ=(fabsf(s.E_az)>tuneDB)?s.E_az:0.0f;
+        float errEL=(fabsf(s.E_el)>tuneDB)?s.E_el:0.0f;
+        trackAZ.baseDeg+=tuneRateAZ*errAZ*dt;
+        trackEL.baseDeg-=tuneRateEL*errEL*dt;
+        trackAZ.baseDeg=constrain(trackAZ.baseDeg,-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+        trackEL.baseDeg=constrain(trackEL.baseDeg,-EL_MAX_ANGLE,EL_MAX_ANGLE);
+    } else {
+        if (gateWasOpen) {
+            gateWasOpen=false; darkStartMs=now;
+            if (trkState==TRK_ACTIVE) { Serial.println(F("[TRACK] Signal lost — holding")); trkState=TRK_FROZEN; }
+        }
+        if (darkStartMs>0&&(now-darkStartMs)>darkTimeoutMs) {
+            Serial.print(F("[AUTO] Dark >")); Serial.print((int)tuneDarkTimeout);
+            Serial.println(F("min — auto-stowing"));
+            currentMode=STOW; lastMode=TRACK;
+            waitingForSun=true; autoStowedAtMs=now; darkStartMs=0;
+            trkState=TRK_FROZEN; trackAZ.baseDeg=0.0f; trackEL.baseDeg=0.0f;
+        }
+    }
+
+    trkCmdAZ=constrain(trackAZ.baseDeg,-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+    trkCmdEL=constrain(trackEL.baseDeg,-EL_MAX_ANGLE,EL_MAX_ANGLE);
+
+    if (printTrackingSnap) {
+        printTrackingSnap=false;
+        float q1=trackAdcV(PIN_Q1),q2=trackAdcV(PIN_Q2);
+        float q3=trackAdcV(PIN_Q3),q4=trackAdcV(PIN_Q4);
+        unsigned long darkSec=(darkStartMs>0&&!s.valid)?(now-darkStartMs)/1000:0;
+        Serial.println(F("  ── Snapshot ───────────────────────────────"));
+        Serial.print(F("  Time: ")); Serial.print(getTimeStr());
+        Serial.print(F("  Uptime: ")); Serial.print(now/1000); Serial.println(F("s"));
+        Serial.print(F("  Gate:")); Serial.print(s.valid?"OPEN":"CLOSED");
+        Serial.print(F("  S=")); Serial.println(s.S,4);
+        Serial.print(F("  NE(Q1):")); Serial.print(q1,4);
+        Serial.print(F("  SE(Q2):")); Serial.print(q2,4);
+        Serial.print(F("  NW(Q3):")); Serial.print(q3,4);
+        Serial.print(F("  SW(Q4):")); Serial.println(q4,4);
+        Serial.print(F("  E_az(corrected)=")); Serial.print(s.E_az,4);
+        Serial.print(F("  E_el(corrected)=")); Serial.println(s.E_el,4);
+        Serial.print(F("  AZ offset=")); Serial.print(azLdrOffset,4);
+        Serial.print(F("  EL offset=")); Serial.println(elLdrOffset,4);
+        Serial.print(F("  cmd_az=")); Serial.print(trkCmdAZ,2);
+        Serial.print(F("  cmd_el=")); Serial.println(trkCmdEL,2);
+        Serial.print(F("  Sol az(N)=")); Serial.print(solAz,2);
+        Serial.print(F("  Sol el=")); Serial.println(solEl,2);
+        Serial.print(F("  Sol az(DAST)=")); Serial.print(solAzDast,2);
+        Serial.print(F("  Sol el(DAST)=")); Serial.println(solElDast,2);
+        float actAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);
+        float actEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);
+        Serial.print(F("  Abs AZ err=")); Serial.print(actAZ-solAzDast,2);
+        Serial.print(F("  Abs EL err=")); Serial.println(actEL-solElDast,2);
+        Serial.print(F("  Panel: ")); Serial.print(panelVoltage,2);
+        Serial.print(F("V  ")); Serial.print(panelCurrent,3);
+        Serial.print(F("A  ")); Serial.print(panelPower,2); Serial.println(F("W"));
+        Serial.print(F("  Dark: ")); Serial.print(darkSec); Serial.println(F("s"));
+        Serial.print(F("  WaitSun: ")); Serial.println(waitingForSun?"YES":"NO");
+        Serial.println(F("  ───────────────────────────────────────────"));
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  CALIBRATION MODE
+// ════════════════════════════════════════════════════════════════════
+void printCalHelp() {
+    Serial.println(F(""));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  DAST v2.10 — CAL MODE"));
+    Serial.println(F("  LDR offset calibration + solar position verification"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  POTS now control panel position — aim at the sun"));
+    Serial.println(F("  until the shadow vane casts NO shadow on any sensor"));
+    Serial.println(F(""));
+    Serial.println(F("  COMMANDS:"));
+    Serial.println(F("    c0    Capture — reads LDR errors at current position,"));
+    Serial.println(F("          computes solar position, calculates absolute"));
+    Serial.println(F("          pointing error, saves LDR offsets to NVS"));
+    Serial.println(F("          Run when shadow is visually eliminated"));
+    Serial.println(F(""));
+    Serial.println(F("    ct    Test — switches to rate controller with offsets"));
+    Serial.println(F("          applied. Panel tracks to null automatically."));
+    Serial.println(F("          Use to verify calibration is effective."));
+    Serial.println(F(""));
+    Serial.println(F("    cs<N><dir>  Log shadow observation"));
+    Serial.println(F("          N = shadow offset in mm"));
+    Serial.println(F("          dir = N S E W NE SE NW SW"));
+    Serial.println(F("          e.g. cs10SE  cs5N  cs0 (no shadow)"));
+    Serial.println(F(""));
+    Serial.println(F("    ox<val>  Manual AZ LDR offset override"));
+    Serial.println(F("    oy<val>  Manual EL LDR offset override"));
+    Serial.println(F("          Use to fine-tune after c0 if still off"));
+    Serial.println(F("          e.g. ox0.05  oy-0.02"));
+    Serial.println(F(""));
+    Serial.println(F("    v     Tracking snapshot (shows raw + corrected errors)"));
+    Serial.println(F("    ?     Full command reference"));
+    Serial.println(F(""));
+    Serial.println(F("    cx    Exit CAL — stows then transitions to TRACK"));
+    Serial.println(F("          Offsets remain active after exit"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.print(F("  Current AZ offset: ")); Serial.print(azLdrOffset,4);
+    Serial.print(F("  EL offset: ")); Serial.println(elLdrOffset,4);
+    Serial.print(F("  Site: ")); Serial.print(siteLat,4);
+    Serial.print(F("N  ")); Serial.print(fabsf(siteLon),4);
+    Serial.println(siteLon<0?F("W"):F("E"));
+    Serial.print(F("  Solar position: az=")); Serial.print(solAz,1);
+    Serial.print(F("  el=")); Serial.print(solEl,1);
+    Serial.print(F("  dast_az=")); Serial.print(solAzDast,1);
+    Serial.print(F("  dast_el=")); Serial.println(solElDast,1);
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F(""));
+}
+
+void captureCalOffsets() {
+    // Read current LDR errors (before offset correction)
+    // Temporarily zero offsets to get raw values
+    float savedAzOff = azLdrOffset;
+    float savedElOff = elLdrOffset;
+    azLdrOffset = 0.0f;
+    elLdrOffset = 0.0f;
+
+    // Average multiple reads for stability
+    float sumEaz=0.0f, sumEel=0.0f;
+    int N=20;
+    for (int i=0;i<N;i++) {
+        SenseResult s=readSensors();
+        sumEaz+=s.E_az;
+        sumEel+=s.E_el;
+        delay(50);
+    }
+    float rawEaz = sumEaz/N;
+    float rawEel = sumEel/N;
+
+    // New offsets = raw errors at visual null
+    azLdrOffset = rawEaz;
+    elLdrOffset = rawEel;
+    nvsSave();
+
+    // Get current physical position
+    float actAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);
+    float actEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);
+
+    // Print calibration report
+    Serial.println(F(""));
+    Serial.println(F("  ── Calibration Report ─────────────────────────────"));
+    Serial.print(F("  Time: ")); Serial.println(getTimeStr());
+    Serial.print(F("  Raw E_az at null: ")); Serial.println(rawEaz,4);
+    Serial.print(F("  Raw E_el at null: ")); Serial.println(rawEel,4);
+    Serial.print(F("  Previous AZ offset: ")); Serial.println(savedAzOff,4);
+    Serial.print(F("  Previous EL offset: ")); Serial.println(savedElOff,4);
+    Serial.print(F("  New AZ offset saved: ")); Serial.println(azLdrOffset,4);
+    Serial.print(F("  New EL offset saved: ")); Serial.println(elLdrOffset,4);
+    Serial.println(F("  ────────────────────────────────────────────────────"));
+    Serial.print(F("  Physical position — AZ: ")); Serial.print(actAZ,2);
+    Serial.print(F("  EL: ")); Serial.println(actEL,2);
+    Serial.print(F("  Solar position (DAST) — AZ: ")); Serial.print(solAzDast,2);
+    Serial.print(F("  EL: ")); Serial.println(solElDast,2);
+    Serial.print(F("  Absolute AZ error: ")); Serial.print(actAZ-solAzDast,2);
+    Serial.println(F(" deg (positive = pointing east of sun)"));
+    Serial.print(F("  Absolute EL error: ")); Serial.print(actEL-solElDast,2);
+    Serial.println(F(" deg (positive = pointing south of sun)"));
+    Serial.println(F("  ────────────────────────────────────────────────────"));
+    Serial.println(F("  Offsets saved to NVS — survive uploads"));
+    Serial.println(F("  Type ct to test, cx to exit CAL"));
+    Serial.println(F(""));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  CONVERSION FUNCTIONS
+// ════════════════════════════════════════════════════════════════════
+int readPotCounts(int pin) {
+    long sum=0;
+    for(int i=0;i<NUM_SAMPLES;i++) sum+=analogRead(pin);
+    return (int)(sum/NUM_SAMPLES);
+}
+
+float countsToAngle(int counts, int zeroCount, float maxAngle) {
+    int span=(counts<=zeroCount)?(zeroCount-POT_COUNT_MIN):(POT_COUNT_MAX-zeroCount);
+    if(span==0) return 0.0f;
+    return constrain(((float)(counts-zeroCount)/span)*maxAngle,-maxAngle,maxAngle);
+}
+
+uint16_t angleToTarget(float angle, float maxAngle) {
+    float t=(constrain(angle,-maxAngle,maxAngle)+maxAngle)/(2.0f*maxAngle);
+    return (uint16_t)constrain((int)(t*JRK_MAX),JRK_MIN,JRK_MAX);
+}
+
+float scaledFeedbackToAngle(uint16_t sf, float maxAngle) {
+    return ((float)sf/JRK_MAX)*(2.0f*maxAngle)-maxAngle;
+}
+
+bool bothAxesAtStow() {
+    uint16_t tAZ=angleToTarget(0.0f,AZ_MAX_ANGLE);
+    uint16_t tEL=angleToTarget(0.0f,EL_MAX_ANGLE);
+    return (abs((int)jrkAZ.getScaledFeedback()-(int)tAZ)<=STOW_TOL)&&
+           (abs((int)jrkEL.getScaledFeedback()-(int)tEL)<=STOW_TOL);
+}
+
+void armTracking() {
+    uint16_t sfAZ=jrkAZ.getScaledFeedback();
+    uint16_t sfEL=jrkEL.getScaledFeedback();
+    trackAZ.baseDeg=scaledFeedbackToAngle(sfAZ,AZ_MAX_ANGLE);
+    trackEL.baseDeg=scaledFeedbackToAngle(sfEL,EL_MAX_ANGLE);
+    trkState=TRK_FROZEN; trkLossMs=0;
+    trkCmdAZ=trackAZ.baseDeg; trkCmdEL=trackEL.baseDeg;
+    gateWasOpen=false; darkStartMs=0; waitingForSun=false; autoStowedAtMs=0;
+    Serial.print(F("  Tracking armed AZ:")); Serial.print(trackAZ.baseDeg,1);
+    Serial.print(F("  EL:")); Serial.println(trackEL.baseDeg,1);
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  POWER SENSING
+// ════════════════════════════════════════════════════════════════════
+float adcPinVolts(int pin) {
+    long sum=0;
+    for(int i=0;i<NUM_SAMPLES;i++) sum+=analogRead(pin);
+    return (float)(sum/NUM_SAMPLES)*(3.3f/4095.0f);
+}
+float readPanelVoltage() { return adcPinVolts(PIN_PANEL_VOLTAGE)*VDIV_RATIO*vcal; }
+float readPanelCurrent() {
+    float v=adcPinVolts(PIN_PANEL_CURRENT)-currentZeroV;
+    if(v<0.0f) v=0.0f;
+    return (v/(INA_OPAMP_GAIN*SHUNT_OHMS))*ical;
+}
+void updatePanelReadings() {
+    panelVoltage=readPanelVoltage();
+    panelCurrent=readPanelCurrent();
+    panelPower=panelVoltage*panelCurrent;
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  NEOPIXEL
+// ════════════════════════════════════════════════════════════════════
+void updateNeoPixel(bool jrkOK, bool mqttOK, bool wifiReconnecting) {
+    (void)mqttOK;
+    static unsigned long lastBlink=0; static bool blinkOn=false;
+    unsigned long now=millis(); uint32_t colour=C_OFF;
+    if (!jrkOK)                               colour=C_RED;
+    else if (currentMode==CAL)                colour=C_MAGENTA;
+    else if (waitingForSun)                   colour=C_CYAN;
+    else if (currentMode==ESTOP)              { if(now-lastBlink>600){lastBlink=now;blinkOn=!blinkOn;} colour=blinkOn?C_ORANGE:C_OFF; }
+    else if (wifiReconnecting&&currentMode!=POT) { if(now-lastBlink>150){lastBlink=now;blinkOn=!blinkOn;} colour=blinkOn?C_WHITE:C_OFF; }
+    else { switch(currentMode) {
+        case POT:           colour=C_AMBER;  break;
+        case STOW:          colour=C_CYAN;   break;
+        case STOW_TO_TRACK: colour=C_PURPLE; break;
+        case REMOTE:        colour=C_BLUE;   break;
+        case TRACK:         colour=C_GREEN;  break;
+        default:            colour=C_OFF;    break;
+    }}
+    neo.setPixelColor(0,colour); neo.show();
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  LCD
+//  Row 0: "V:20.45V  I:1.180A  "
+//  Row 1: "P:19.08W  TRACK     " (or CAL or WAIT SUN)
+//  Row 2: "AZ: -45.0 EL: +30.0 "
+//  Row 3: "W:OK M:OK S:  0.31  "
+// ════════════════════════════════════════════════════════════════════
+void lcdPF(float val, int w, int d) { char buf[12]; dtostrf(val,w,d,buf); lcd.print(buf); }
+
+void updateLCD(float actAZ, float actEL, bool wifiOK, bool mqttOK) {
+    lcd.setCursor(0,0);
+    lcd.print(F("V:")); lcdPF(panelVoltage,5,2);
+    lcd.print(F("V  I:")); lcdPF(panelCurrent,5,3); lcd.print(F("A  "));
+
+    lcd.setCursor(0,1);
+    lcd.print(F("P:")); lcdPF(panelPower,5,2); lcd.print(F("W  "));
+    if (waitingForSun)      { lcd.print(F("WAIT SUN  ")); }
+    else if (currentMode==CAL && calTestActive) { lcd.print(F("CAL TEST  ")); }
+    else { switch(currentMode) {
+        case POT:           lcd.print(F("MANUAL    ")); break;
+        case CAL:           lcd.print(F("CAL       ")); break;
+        case REMOTE:        lcd.print(F("REMOTE    ")); break;
+        case STOW:          lcd.print(F("STOW      ")); break;
+        case ESTOP:         lcd.print(F("ESTOP     ")); break;
+        case TRACK:         lcd.print(F("TRACK     ")); break;
+        case STOW_TO_TRACK: lcd.print(F("STOWING   ")); break;
+        default:            lcd.print(F("----------")); break;
+    }}
+
+    lcd.setCursor(0,2);
+    lcd.print(F("AZ:")); lcdPF(actAZ,6,1);
+    lcd.print(F(" EL:")); lcdPF(actEL,6,1); lcd.print(F(" "));
+
+    lcd.setCursor(0,3);
+    lcd.print(wifiOK?F("W:OK "):F("W:-- "));
+    lcd.print(mqttOK?F("M:OK "):F("M:-- "));
+    lcd.print(F("S:")); lcdPF(lastSense.S,5,2); lcd.print(F("  "));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SERIAL COMMAND HELP
+// ════════════════════════════════════════════════════════════════════
+void printHelp() {
+    Serial.println(F(""));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  DAST v2.10 — Serial Command Reference"));
+    Serial.println(F("  All values saved to NVS flash — survive uploads"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  TRACKING:"));
+    Serial.print(F("    r  AZ rate (deg/sec)         : ")); Serial.println(tuneRateAZ,2);
+    Serial.print(F("    e  EL rate (deg/sec)         : ")); Serial.println(tuneRateEL,2);
+    Serial.print(F("    d  Deadband                  : ")); Serial.println(tuneDB,4);
+    Serial.print(F("    g  Gate threshold            : ")); Serial.println(tuneGate,3);
+    Serial.print(F("    h  Gate hysteresis           : ")); Serial.println(tuneGateHyst,2);
+    Serial.print(F("    q  Reacquire gate            : ")); Serial.println(tuneReacquireGate,1);
+    Serial.print(F("    t  Dark timeout (min)        : ")); Serial.println(tuneDarkTimeout,1);
+    Serial.println(F("  CALIBRATION:"));
+    Serial.print(F("    cal  Enter/exit CAL mode"));
+    Serial.println(F("  (prints full CAL instructions)"));
+    Serial.print(F("    ox AZ LDR offset             : ")); Serial.println(azLdrOffset,4);
+    Serial.print(F("    oy EL LDR offset             : ")); Serial.println(elLdrOffset,4);
+    Serial.println(F("  COORDINATES:"));
+    Serial.print(F("    lat  Latitude (decimal deg N): ")); Serial.println(siteLat,4);
+    Serial.print(F("    lon  Longitude (decimal deg) : ")); Serial.println(siteLon,4);
+    Serial.println(F("  POWER:"));
+    Serial.print(F("    c  VCAL voltage trim         : ")); Serial.println(vcal,4);
+    Serial.print(F("    a  ICAL current trim         : ")); Serial.println(ical,4);
+    Serial.print(F("    n  Current zero (V)          : ")); Serial.println(currentZeroV,4);
+    Serial.println(F("  DATA:"));
+    Serial.print(F("    l  CSV logging               : ")); Serial.println(csvLogging?"ON":"OFF");
+    Serial.println(F("    v  Snapshot (all values)"));
+    Serial.println(F("    z  Re-arm tracking from current position"));
+    Serial.println(F("    ?  This help"));
+    Serial.println(F("    !  Reset all to defaults"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  QUICK REFERENCE:"));
+    Serial.println(F("    Outdoor sun:  g0.31 h0.5 r10 e15 d0.02 t10 q8"));
+    Serial.println(F("    Paper atten:  g2.0  h0.5 r10 e15 d0.02 t10 q8"));
+    Serial.println(F("    Bench light:  g5.0  h1.0 r15 e20 d0.1  t1  q8"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.print(F("  Solar: az=")); Serial.print(solAz,1);
+    Serial.print(F("  el=")); Serial.print(solEl,1);
+    Serial.print(F("  dast_az=")); Serial.print(solAzDast,1);
+    Serial.print(F("  dast_el=")); Serial.println(solElDast,1);
+    Serial.print(F("  Time: ")); Serial.print(getTimeStr());
+    Serial.print(F("  Uptime: ")); Serial.print(millis()/1000); Serial.println(F("s"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F(""));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SERIAL TUNING HANDLER
+// ════════════════════════════════════════════════════════════════════
+void handleSerialTuning() {
+    static String buf="";
+    while (Serial.available()) {
+        char c=(char)Serial.read();
+        if (c=='\n'||c=='\r') {
+            buf.trim();
+            if (buf.length()==0) { buf=""; return; }
+
+            // Multi-char commands first
+            if (buf.equalsIgnoreCase("cal")) {
+                if (currentMode!=CAL) {
+                    currentMode=CAL; calTestActive=false;
+                    capturedPotAZ=readPotCounts(PIN_POT_AZ);
+                    capturedPotEL=readPotCounts(PIN_POT_EL);
+                    uint16_t sfAZ=jrkAZ.getScaledFeedback();
+                    uint16_t sfEL=jrkEL.getScaledFeedback();
+                    holdAZ=scaledFeedbackToAngle(sfAZ,AZ_MAX_ANGLE);
+                    holdEL=scaledFeedbackToAngle(sfEL,EL_MAX_ANGLE);
+                    azPickedUp=false; elPickedUp=false;
+                    updateSolarPosition();
+                    printCalHelp();
+                } else {
+                    Serial.println(F("  Already in CAL — use cx to exit"));
+                }
+                buf=""; return;
+            }
+            if (buf.equalsIgnoreCase("c0")) {
+                if (currentMode==CAL) { captureCalOffsets(); }
+                else { Serial.println(F("  c0 only works in CAL mode — type cal first")); }
+                buf=""; return;
+            }
+            if (buf.equalsIgnoreCase("ct")) {
+                if (currentMode==CAL) {
+                    calTestActive=true;
+                    armTracking();
+                    Serial.println(F("  CAL TEST — rate controller active with offsets"));
+                    Serial.println(F("  Type c0 to recapture, cx to exit"));
+                } else { Serial.println(F("  ct only works in CAL mode")); }
+                buf=""; return;
+            }
+            if (buf.equalsIgnoreCase("cx")) {
+                if (currentMode==CAL) {
+                    calTestActive=false;
+                    currentMode=STOW_TO_TRACK; lastMode=TRACK;
+                    stowConfirmed=false; stowConfirmedMs=0;
+                    Serial.println(F("  Exiting CAL — stowing then TRACK"));
+                    Serial.print(F("  Active offsets: AZ=")); Serial.print(azLdrOffset,4);
+                    Serial.print(F("  EL=")); Serial.println(elLdrOffset,4);
+                } else { Serial.println(F("  Not in CAL mode")); }
+                buf=""; return;
+            }
+            if (buf.length()>=3 && buf.substring(0,2).equalsIgnoreCase("cs")) {
+                // Shadow entry: cs10SE or cs0
+                String rest=buf.substring(2);
+                // Split numeric from direction
+                int dirStart=0;
+                for (int i=0;i<rest.length();i++) {
+                    if (isAlpha(rest.charAt(i))) { dirStart=i; break; }
+                }
+                float shadowMm=rest.toFloat();
+                String dir=(dirStart>0)?rest.substring(dirStart):"none";
+                Serial.print(F("  Shadow logged: ")); Serial.print(shadowMm,1);
+                Serial.print(F("mm  Dir:")); Serial.println(dir);
+                // Log to CSV as shadow observation row
+                if (csvLogging) {
+                    String ts=getTimestampCSV();
+                    float actAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);
+                    float actEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);
+                    Serial.print(ts); Serial.print(F(",cal_shadow,"));
+                    Serial.print(actAZ,2); Serial.print(F(","));
+                    Serial.print(actEL,2); Serial.print(F(","));
+                    Serial.print(shadowMm,1); Serial.print(F(","));
+                    Serial.print(dir); Serial.print(F(","));
+                    Serial.print(solAz,2); Serial.print(F(","));
+                    Serial.print(solEl,2); Serial.print(F(","));
+                    Serial.print(solAzDast,2); Serial.print(F(","));
+                    Serial.println(solElDast,2);
+                }
+                buf=""; return;
+            }
+            if (buf.length()>=3 && buf.substring(0,2).equalsIgnoreCase("ox")) {
+                azLdrOffset=buf.substring(2).toFloat(); nvsSave();
+                Serial.print(F("  AZ LDR offset -> ")); Serial.print(azLdrOffset,4); Serial.println(F(" (saved)"));
+                buf=""; return;
+            }
+            if (buf.length()>=3 && buf.substring(0,2).equalsIgnoreCase("oy")) {
+                elLdrOffset=buf.substring(2).toFloat(); nvsSave();
+                Serial.print(F("  EL LDR offset -> ")); Serial.print(elLdrOffset,4); Serial.println(F(" (saved)"));
+                buf=""; return;
+            }
+            if (buf.length()>=4 && buf.substring(0,3).equalsIgnoreCase("lat")) {
+                siteLat=buf.substring(3).toFloat(); nvsSave();
+                Serial.print(F("  Latitude -> ")); Serial.print(siteLat,4); Serial.println(F(" (saved)"));
+                buf=""; return;
+            }
+            if (buf.length()>=4 && buf.substring(0,3).equalsIgnoreCase("lon")) {
+                siteLon=buf.substring(3).toFloat(); nvsSave();
+                Serial.print(F("  Longitude -> ")); Serial.print(siteLon,4); Serial.println(F(" (saved)"));
+                buf=""; return;
+            }
+
+            // Single-char commands
+            char cmd=buf.charAt(0);
+            float val=buf.substring(1).toFloat();
+            switch(cmd) {
+                case 'r': case 'R': tuneRateAZ=val; nvsSave();
+                    Serial.print(F("  AZ Rate -> ")); Serial.print(tuneRateAZ,2); Serial.println(F(" (saved)")); break;
+                case 'e': case 'E': tuneRateEL=val; nvsSave();
+                    Serial.print(F("  EL Rate -> ")); Serial.print(tuneRateEL,2); Serial.println(F(" (saved)")); break;
+                case 'd': case 'D': tuneDB=val; nvsSave();
+                    Serial.print(F("  Deadband -> ")); Serial.print(tuneDB,4); Serial.println(F(" (saved)")); break;
+                case 'g': case 'G': tuneGate=val; nvsSave();
+                    Serial.print(F("  GateThresh -> ")); Serial.print(tuneGate,3); Serial.println(F(" (saved)")); break;
+                case 'h': case 'H': tuneGateHyst=val; nvsSave();
+                    Serial.print(F("  GateHyst -> ")); Serial.print(tuneGateHyst,2); Serial.println(F(" (saved)")); break;
+                case 'q': case 'Q': tuneReacquireGate=val; nvsSave();
+                    Serial.print(F("  ReacquireGate -> ")); Serial.print(tuneReacquireGate,1); Serial.println(F(" (saved)")); break;
+                case 't': case 'T': tuneDarkTimeout=val; nvsSave();
+                    Serial.print(F("  DarkTimeout -> ")); Serial.print(tuneDarkTimeout,1); Serial.println(F("min (saved)")); break;
+                case 'c': case 'C': vcal=val; nvsSave();
+                    Serial.print(F("  VCAL -> ")); Serial.print(vcal,4); Serial.println(F(" (saved)")); break;
+                case 'a': case 'A': ical=val; nvsSave();
+                    Serial.print(F("  ICAL -> ")); Serial.print(ical,4); Serial.println(F(" (saved)")); break;
+                case 'n': case 'N': currentZeroV=val; nvsSave();
+                    Serial.print(F("  CurrentZero -> ")); Serial.print(currentZeroV,4); Serial.println(F("V (saved)")); break;
+                case 'l': case 'L':
+                    csvLogging=!csvLogging;
+                    if (csvLogging) {
+                        Serial.println(F("  CSV logging ON"));
+                        Serial.println(F("timestamp,mode,az_cmd,az_actual,az_error,el_cmd,el_actual,el_error,trk_e_az,trk_e_el,trk_irrad,trk_valid,trk_state,panel_v,panel_i,panel_w,sol_az,sol_el,sol_az_dast,sol_el_dast,abs_az_error,abs_el_error,uptime_s,dark_timer_s,waiting_for_sun"));
+                    } else { Serial.println(F("  CSV logging OFF")); }
+                    break;
+                case 'z': case 'Z':
+                    if (currentMode==TRACK) { armTracking(); Serial.println(F("  Re-armed from current position")); }
+                    else Serial.println(F("  z only works in TRACK mode"));
+                    break;
+                case 'v': case 'V': printTrackingSnap=true; break;
+                case '?': printHelp(); break;
+                case '!': nvsReset(); printHelp(); break;
+                default:
+                    Serial.print(F("  Unknown: ")); Serial.println(buf);
+                    Serial.println(F("  Type ? for command reference"));
+                    break;
+            }
+            buf="";
+        } else { buf+=c; }
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SWITCH HANDLERS
+// ════════════════════════════════════════════════════════════════════
+void onSwitchClosed(float actAZ, float actEL) {
+    capturedPotAZ=readPotCounts(PIN_POT_AZ); capturedPotEL=readPotCounts(PIN_POT_EL);
+    holdAZ=actAZ; holdEL=actEL; azPickedUp=false; elPickedUp=false;
+    stowConfirmed=false; stowConfirmedMs=0;
+    waitingForSun=false; autoStowedAtMs=0; darkStartMs=0;
+    calTestActive=false;
+    currentMode=POT; lastMode=POT;
+    Serial.println(F("[SWITCH] Manual — holding until pots move"));
+}
+
+void onSwitchOpened() {
+    if (currentMode==CAL) {
+        Serial.println(F("[SWITCH] AUTO while in CAL — exiting CAL, stow then TRACK"));
+        calTestActive=false;
+    }
+    currentMode=STOW_TO_TRACK; lastMode=TRACK;
+    stowConfirmed=false; stowConfirmedMs=0;
+    Serial.println(F("[SWITCH] Automatic — stow then TRACK"));
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  MQTT CALLBACK
+// ════════════════════════════════════════════════════════════════════
+void onMQTTMessage(char* topic, byte* payload, unsigned int length) {
+    if (strcmp(topic,TOPIC_COMMAND)!=0) return;
+    StaticJsonDocument<256> doc;
+    if (deserializeJson(doc,payload,length)) return;
+    if (doc.containsKey("heartbeat")) { lastHeartbeatMs=millis(); return; }
+    bool sw=(digitalRead(PIN_SWITCH)==LOW);
+    if (doc.containsKey("mode")) {
+        String m=doc["mode"].as<String>();
+        if      (m=="track")  { if(!sw){armTracking();lastMode=TRACK;currentMode=TRACK;Serial.println(F("Mode->TRACK"));} }
+        else if (m=="remote") { if(!sw){remoteAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);remoteEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);lastMode=REMOTE;currentMode=REMOTE;Serial.println(F("Mode->REMOTE"));} }
+        else if (m=="pot")    { lastMode=POT;currentMode=POT;capturedPotAZ=readPotCounts(PIN_POT_AZ);capturedPotEL=readPotCounts(PIN_POT_EL);holdAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);holdEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);azPickedUp=false;elPickedUp=false;Serial.println(F("Mode->POT")); }
+        else if (m=="stow")   { lastMode=STOW;currentMode=STOW;Serial.println(F("Mode->STOW")); }
+        else if (m=="estop")  { currentMode=ESTOP;Serial.println(F("Mode->ESTOP")); }
+        else if (m=="resume") {
+            if(sw&&(lastMode==TRACK||lastMode==REMOTE)){currentMode=POT;Serial.println(F("Mode->POT(sw)"));}
+            else{currentMode=lastMode;}
+        }
+    }
+    if (currentMode==REMOTE) {
+        if (doc.containsKey("az_setpoint")) remoteAZ=constrain(doc["az_setpoint"].as<float>(),-AZ_MAX_ANGLE,AZ_MAX_ANGLE);
+        if (doc.containsKey("el_setpoint")) remoteEL=constrain(doc["el_setpoint"].as<float>(),-EL_MAX_ANGLE,EL_MAX_ANGLE);
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  WIFI / MQTT
+// ════════════════════════════════════════════════════════════════════
+void startWiFi() {
+    Serial.println(F("WiFi: connecting to NETGEAR08..."));
+    WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+}
+
+bool connectMQTT() {
+    if (mqttClient.connected()) return true;
+    Serial.print(F("MQTT connecting..."));
+    if (mqttClient.connect(MQTT_CLIENT_ID,MQTT_USER,MQTT_PASS,TOPIC_STATUS,0,true,"offline")) {
+        mqttClient.subscribe(TOPIC_COMMAND);
+        mqttClient.publish(TOPIC_STATUS,"online",true);
+        Serial.println(F(" connected")); return true;
+    }
+    Serial.print(F(" failed rc=")); Serial.println(mqttClient.state()); return false;
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  TELEMETRY
+// ════════════════════════════════════════════════════════════════════
+void publishTelemetry(float cmdAZ, float cmdEL, float actAZ, float actEL,
+                      float errAZ, float errEL, bool jrkOK,
+                      uint16_t jrkErrAZ, uint16_t jrkErrEL) {
+    StaticJsonDocument<768> doc;
+    doc["az_cmd"]          = round(cmdAZ*10.0f)/10.0f;
+    doc["el_cmd"]          = round(cmdEL*10.0f)/10.0f;
+    doc["az_actual"]       = round(actAZ*10.0f)/10.0f;
+    doc["el_actual"]       = round(actEL*10.0f)/10.0f;
+    doc["az_error"]        = round(errAZ*10.0f)/10.0f;
+    doc["el_error"]        = round(errEL*10.0f)/10.0f;
+    doc["mode"]            = (currentMode==POT?"pot":currentMode==REMOTE?"remote":
+                              currentMode==STOW?"stow":currentMode==ESTOP?"estop":
+                              currentMode==TRACK?"track":currentMode==CAL?"cal":
+                              currentMode==STOW_TO_TRACK?"stow_to_track":"unknown");
+    doc["jrk_ok"]          = jrkOK;
+    doc["hw_manual"]       = (digitalRead(PIN_SWITCH)==LOW);
+    doc["uptime_s"]        = millis()/1000;
+    doc["wifi_rssi"]       = WiFi.RSSI();
+    doc["trk_e_az"]        = round(lastSense.E_az*1000.0f)/1000.0f;
+    doc["trk_e_el"]        = round(lastSense.E_el*1000.0f)/1000.0f;
+    doc["trk_irrad"]       = round(lastSense.S*1000.0f)/1000.0f;
+    doc["trk_valid"]       = lastSense.valid;
+    doc["trk_state"]       = (trkState==TRK_ACTIVE?"active":"frozen");
+    doc["waiting_for_sun"] = waitingForSun;
+    doc["sol_az"]          = round(solAz*10.0f)/10.0f;
+    doc["sol_el"]          = round(solEl*10.0f)/10.0f;
+    doc["sol_az_dast"]     = round(solAzDast*10.0f)/10.0f;
+    doc["sol_el_dast"]     = round(solElDast*10.0f)/10.0f;
+    doc["abs_az_error"]    = round((actAZ-solAzDast)*10.0f)/10.0f;
+    doc["abs_el_error"]    = round((actEL-solElDast)*10.0f)/10.0f;
+    doc["panel_v"]         = round(panelVoltage*100.0f)/100.0f;
+    doc["panel_i"]         = round(panelCurrent*1000.0f)/1000.0f;
+    doc["panel_w"]         = round(panelPower*100.0f)/100.0f;
+    char buffer[768];
+    size_t len=serializeJson(doc,buffer);
+    mqttClient.publish(TOPIC_TELEMETRY,buffer,len);
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════════════
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+
+    neo.begin(); neo.setBrightness(NEO_BRIGHTNESS);
+    neo.setPixelColor(0,C_RED); neo.show();
+
+    nvsLoad();
+
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_Q1,           ADC_11db);
+    analogSetPinAttenuation(PIN_Q2,           ADC_11db);
+    analogSetPinAttenuation(PIN_Q3,           ADC_11db);
+    analogSetPinAttenuation(PIN_Q4,           ADC_11db);
+    analogSetPinAttenuation(PIN_PANEL_VOLTAGE,ADC_11db);
+    analogSetPinAttenuation(PIN_PANEL_CURRENT,ADC_11db);
+    analogSetPinAttenuation(PIN_POT_AZ,       ADC_11db);
+    analogSetPinAttenuation(PIN_POT_EL,       ADC_11db);
+    pinMode(PIN_SWITCH,INPUT_PULLUP);
+
+    Wire.begin(PIN_SDA,PIN_SCL); Wire.setClock(400000);
+
+    lcd.init(); lcd.backlight();
+    lcd.setCursor(0,0); lcd.print(F("DAST  v2.10         "));
+    lcd.setCursor(0,1); lcd.print(F("Initializing...     "));
+    lcd.setCursor(0,2); lcd.print(F("                    "));
+    lcd.setCursor(0,3); lcd.print(F("                    "));
+
+    Serial.println();
+    Serial.println(F("════════════════════════════════════════════════════════"));
+    Serial.println(F("  DAST v2.10 — Dual Axis Solar Tracker"));
+    Serial.println(F("  Solar position | CAL mode | LDR offsets"));
+    Serial.println(F("  Type ? for commands  |  type cal for calibration"));
+    Serial.println(F("════════════════════════════════════════════════════════"));
+
+    uint16_t sfAZ=jrkAZ.getScaledFeedback(), sfEL=jrkEL.getScaledFeedback();
+    Serial.print(F("  Jrk AZ: ")); Serial.println(sfAZ<=4095?F("OK"):F("NO RESPONSE"));
+    Serial.print(F("  Jrk EL: ")); Serial.println(sfEL<=4095?F("OK"):F("NO RESPONSE"));
+
+    // Switch debounce at boot
+    delay(50); bool sw1=(digitalRead(PIN_SWITCH)==LOW);
+    delay(50); bool sw2=(digitalRead(PIN_SWITCH)==LOW);
+    prevSwitchManual=(sw1&&sw2);
+
+    if (prevSwitchManual) {
+        capturedPotAZ=readPotCounts(PIN_POT_AZ); capturedPotEL=readPotCounts(PIN_POT_EL);
+        holdAZ=scaledFeedbackToAngle(sfAZ,AZ_MAX_ANGLE);
+        holdEL=scaledFeedbackToAngle(sfEL,EL_MAX_ANGLE);
+        azPickedUp=false; elPickedUp=false;
+        currentMode=POT; lastMode=POT;
+        Serial.println(F("  Switch: MANUAL"));
+    } else {
+        currentMode=STOW; lastMode=STOW;
+        Serial.println(F("  Switch: AUTO — STOW"));
+    }
+
+    Serial.print(F("  LDR offsets: AZ=")); Serial.print(azLdrOffset,4);
+    Serial.print(F("  EL=")); Serial.println(elLdrOffset,4);
+    Serial.print(F("  Site: ")); Serial.print(siteLat,4);
+    Serial.print(F("N  ")); Serial.print(fabsf(siteLon),4);
+    Serial.println(siteLon<0?F("W"):F("E"));
+
+    { float z=adcPinVolts(PIN_PANEL_CURRENT);
+      Serial.print(F("  Current zero pin: ")); Serial.print(z,4); Serial.println(F("V")); }
+    updatePanelReadings();
+    Serial.print(F("  Panel: ")); Serial.print(panelVoltage,2);
+    Serial.print(F("V  ")); Serial.print(panelCurrent,3);
+    Serial.print(F("A  ")); Serial.print(panelPower,2); Serial.println(F("W"));
+
+    mqttClient.setServer(MQTT_SERVER,MQTT_PORT);
+    mqttClient.setCallback(onMQTTMessage);
+    mqttClient.setBufferSize(768);
+    mqttClient.setKeepAlive(60);
+
+    startWiFi();
+    lastWifiAttempt=millis();
+
+    lcd.setCursor(0,1);
+    lcd.print(prevSwitchManual?F("Mode: MANUAL        "):F("Mode: STOW          "));
+    lcd.setCursor(0,3); lcd.print(F("WiFi: connecting... "));
+
+    printHelp();
+    Serial.println(F("Running — type cal to calibrate LDR offsets"));
+    Serial.println();
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ════════════════════════════════════════════════════════════════════
+void loop() {
+    static unsigned long lastLoop      = 0;
+    static unsigned long lastTelemetry = 0;
+    static unsigned long lastLCD       = 0;
+    static unsigned long lastCSV       = 0;
+    static unsigned long lastSolar     = 0;
+
+    handleSerialTuning();
+    if (mqttClient.connected()) mqttClient.loop();
+
+    unsigned long now=millis();
+    if (now-lastLoop<LOOP_MS) return;
+    lastLoop=now;
+
+    // WiFi watchdog
+    bool wifiOK=(WiFi.status()==WL_CONNECTED);
+    if (!wifiOK) {
+        if (wifiWasConnected) { Serial.println(F("WiFi lost")); wifiWasConnected=false; }
+        if (now-lastWifiAttempt>WIFI_RETRY_MS) {
+            lastWifiAttempt=now; WiFi.disconnect(); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+        }
+    } else {
+        if (!wifiWasConnected) {
+            wifiWasConnected=true;
+            Serial.print(F("WiFi connected — IP: ")); Serial.println(WiFi.localIP());
+            if (!ntpSynced) {
+                configTime(GMT_OFFSET,DST_OFFSET,NTP_SERVER);
+                struct tm t;
+                if (getLocalTime(&t,5000)) {
+                    ntpSynced=true;
+                    Serial.print(F("NTP synced — ")); Serial.println(getTimeStr());
+                    updateSolarPosition();
+                } else Serial.println(F("NTP sync failed"));
+            }
+        }
+    }
+
+    // MQTT watchdog
+    bool mqttOK=mqttClient.connected();
+    if (!mqttOK&&wifiOK&&(now-lastMqttAttempt>MQTT_RECONNECT_MS)) {
+        lastMqttAttempt=now; mqttOK=connectMQTT();
+    }
+
+    // Update solar position every 30s
+    if (ntpSynced && (now-lastSolar>30000UL)) {
+        lastSolar=now; updateSolarPosition();
+    }
+
+    updatePanelReadings();
+
+    // S updates every loop regardless of mode
+    { SenseResult sg=readSensors(); lastSense.S=sg.S; }
+
+    float actAZ=scaledFeedbackToAngle(jrkAZ.getScaledFeedback(),AZ_MAX_ANGLE);
+    float actEL=scaledFeedbackToAngle(jrkEL.getScaledFeedback(),EL_MAX_ANGLE);
+
+    bool switchManual=(digitalRead(PIN_SWITCH)==LOW);
+    if ( switchManual&&!prevSwitchManual) onSwitchClosed(actAZ,actEL);
+    if (!switchManual&& prevSwitchManual) onSwitchOpened();
+    prevSwitchManual=switchManual;
+
+    // Pot pickup tracking
+    int curPotAZ=0,curPotEL=0;
+    if (currentMode==POT||currentMode==CAL) {
+        curPotAZ=readPotCounts(PIN_POT_AZ); curPotEL=readPotCounts(PIN_POT_EL);
+        if (!azPickedUp&&abs(curPotAZ-capturedPotAZ)>POT_PICKUP_COUNTS) { azPickedUp=true; }
+        if (!elPickedUp&&abs(curPotEL-capturedPotEL)>POT_PICKUP_COUNTS) { elPickedUp=true; }
+    }
+
+    // Stow-to-track
+    if (currentMode==STOW_TO_TRACK) {
+        jrkAZ.setTarget(angleToTarget(0.0f,AZ_MAX_ANGLE));
+        jrkEL.setTarget(angleToTarget(0.0f,EL_MAX_ANGLE));
+        if (!stowConfirmed) {
+            if (bothAxesAtStow()) {
+                stowConfirmed=true; stowConfirmedMs=now;
+                if (waitingForSun) autoStowedAtMs=now;
+                Serial.println(F("[STOW_TO_TRACK] Confirmed — 3s"));
+            }
+        } else if (now-stowConfirmedMs>=STOW_TO_TRACK_DELAY_MS) {
+            if (!waitingForSun) { armTracking(); currentMode=TRACK; lastMode=TRACK; Serial.println(F("[STOW_TO_TRACK] -> TRACK")); }
+            else { currentMode=TRACK; lastMode=TRACK; Serial.println(F("[STOW_TO_TRACK] -> TRACK (waiting for sun)")); }
+        }
+        uint16_t eAZ=jrkAZ.getErrorFlagsHalting(), eEL=jrkEL.getErrorFlagsHalting();
+        updateNeoPixel((eAZ==0)&&(eEL==0),mqttOK,!wifiOK);
+        if (now-lastLCD>LCD_UPDATE_MS) { lastLCD=now; updateLCD(actAZ,actEL,wifiOK,mqttOK); }
+        return;
+    }
+
+    // Commanded angles
+    float cmdAZ=0.0f, cmdEL=0.0f;
+    switch(currentMode) {
+        case TRACK:
+            runTracking(now);
+            cmdAZ=trkCmdAZ; cmdEL=trkCmdEL;
+            break;
+        case CAL:
+            if (calTestActive) {
+                // Rate controller active with offsets — test mode
+                runTracking(now);
+                cmdAZ=trkCmdAZ; cmdEL=trkCmdEL;
+            } else {
+                // Pot control — aim manually
+                float pAZ=countsToAngle(curPotAZ,AZ_COUNT_ZERO,AZ_MAX_ANGLE);
+                float pEL=countsToAngle(curPotEL,EL_COUNT_ZERO,EL_MAX_ANGLE);
+                cmdAZ=azPickedUp?pAZ:holdAZ;
+                cmdEL=elPickedUp?pEL:holdEL;
+            }
+            break;
+        case STOW:
+            if (waitingForSun) runTracking(now);
+            cmdAZ=0.0f; cmdEL=0.0f;
+            break;
+        case POT: {
+            float pAZ=countsToAngle(curPotAZ,AZ_COUNT_ZERO,AZ_MAX_ANGLE);
+            float pEL=countsToAngle(curPotEL,EL_COUNT_ZERO,EL_MAX_ANGLE);
+            cmdAZ=azPickedUp?pAZ:holdAZ;
+            cmdEL=elPickedUp?pEL:holdEL;
+            break;
+        }
+        case REMOTE: cmdAZ=remoteAZ; cmdEL=remoteEL; break;
+        case ESTOP:  cmdAZ=heldAZ;   cmdEL=heldEL;   break;
+        default:     cmdAZ=0.0f;     cmdEL=0.0f;     break;
+    }
+
+    jrkAZ.setTarget(angleToTarget(cmdAZ,AZ_MAX_ANGLE));
+    jrkEL.setTarget(angleToTarget(cmdEL,EL_MAX_ANGLE));
+    if (currentMode!=ESTOP) { heldAZ=actAZ; heldEL=actEL; }
+
+    float errAZ=actAZ-cmdAZ, errEL=actEL-cmdEL;
+
+    uint16_t jrkErrAZ=jrkAZ.getErrorFlagsHalting();
+    uint16_t jrkErrEL=jrkEL.getErrorFlagsHalting();
+    if (jrkErrAZ) { Serial.print(F("AZ Jrk err: 0x")); Serial.println(jrkErrAZ,HEX); }
+    if (jrkErrEL) { Serial.print(F("EL Jrk err: 0x")); Serial.println(jrkErrEL,HEX); }
+    bool jrkOK=(jrkErrAZ==0)&&(jrkErrEL==0);
+
+    dashboardActive=(lastHeartbeatMs>0)&&((now-lastHeartbeatMs)<HEARTBEAT_TIMEOUT_MS);
+    updateNeoPixel(jrkOK,mqttOK,!wifiOK);
+
+    if (now-lastLCD>LCD_UPDATE_MS) { lastLCD=now; updateLCD(actAZ,actEL,wifiOK,mqttOK); }
+
+    if (mqttOK&&(now-lastTelemetry>TELEMETRY_MS)) {
+        lastTelemetry=now;
+        publishTelemetry(cmdAZ,cmdEL,actAZ,actEL,errAZ,errEL,jrkOK,jrkErrAZ,jrkErrEL);
+    }
+
+    // CSV logging
+    if (csvLogging&&(now-lastCSV>TELEMETRY_MS)) {
+        lastCSV=now;
+        unsigned long darkSec=(!lastSense.valid&&darkStartMs>0)?(now-darkStartMs)/1000:0;
+        String modeStr;
+        if      (currentMode==POT)           modeStr="pot";
+        else if (currentMode==REMOTE)        modeStr="remote";
+        else if (currentMode==STOW)          modeStr="stow";
+        else if (currentMode==ESTOP)         modeStr="estop";
+        else if (currentMode==TRACK)         modeStr="track";
+        else if (currentMode==CAL&&calTestActive) modeStr="cal_test";
+        else if (currentMode==CAL)           modeStr="cal";
+        else if (currentMode==STOW_TO_TRACK) modeStr="stowin";
+        else                                 modeStr="unk";
+
+        Serial.print(getTimestampCSV());     Serial.print(",");
+        Serial.print(modeStr);               Serial.print(",");
+        Serial.print(cmdAZ,2);               Serial.print(",");
+        Serial.print(actAZ,2);               Serial.print(",");
+        Serial.print(errAZ,2);               Serial.print(",");
+        Serial.print(cmdEL,2);               Serial.print(",");
+        Serial.print(actEL,2);               Serial.print(",");
+        Serial.print(errEL,2);               Serial.print(",");
+        Serial.print(lastSense.E_az,3);      Serial.print(",");
+        Serial.print(lastSense.E_el,3);      Serial.print(",");
+        Serial.print(lastSense.S,3);         Serial.print(",");
+        Serial.print(lastSense.valid?1:0);   Serial.print(",");
+        Serial.print(trkState==TRK_ACTIVE?"active":"frozen"); Serial.print(",");
+        Serial.print(panelVoltage,2);        Serial.print(",");
+        Serial.print(panelCurrent,3);        Serial.print(",");
+        Serial.print(panelPower,2);          Serial.print(",");
+        Serial.print(solAz,2);               Serial.print(",");
+        Serial.print(solEl,2);               Serial.print(",");
+        Serial.print(solAzDast,2);           Serial.print(",");
+        Serial.print(solElDast,2);           Serial.print(",");
+        Serial.print(actAZ-solAzDast,2);     Serial.print(",");
+        Serial.print(actEL-solElDast,2);     Serial.print(",");
+        Serial.print(now/1000);              Serial.print(",");
+        Serial.print(darkSec);               Serial.print(",");
+        Serial.println(waitingForSun?1:0);
+    }
+}
